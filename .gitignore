@@ -1,0 +1,20 @@
+# Environment variables
+.env
+.env.local
+
+# Python virtual environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# Logs
+error.log
+error.txt
+
+# Local folders
+KMS/
+
+# IDE settings
+.vscode/
+.idea/
