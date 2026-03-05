@@ -6,12 +6,12 @@ import asyncio
 from dotenv import load_dotenv
 
 from livekit import agents, api
-from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
+from livekit.agents import AgentSession, Agent, RoomOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
     cartesia,
     sarvam,
-    noise_cancellation,
+    # noise_cancellation,  # Temporarily disabled to test memory usage
     silero,
 )
 from livekit.agents import llm
@@ -518,9 +518,8 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=agent,
-        room_input_options=RoomInputOptions(
-            noise_cancellation=noise_cancellation.BVCTelephony(),
-            close_on_disconnect=True, # Close room when agent disconnects
+        room_options=RoomOptions(
+            # noise_cancellation=noise_cancellation.BVCTelephony(),  # Temporarily disabled to test memory
         ),
     )
 
