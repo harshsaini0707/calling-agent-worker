@@ -6,7 +6,7 @@ import asyncio
 from dotenv import load_dotenv
 
 from livekit import agents, api
-from livekit.agents import AgentSession, Agent, RoomOptions, get_job_context, function_tool, RunContext
+from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
     cartesia,
@@ -518,8 +518,9 @@ async def entrypoint(ctx: agents.JobContext):
     await session.start(
         room=ctx.room,
         agent=agent,
-        room_options=RoomOptions(
+        room_input_options=RoomInputOptions(
             # noise_cancellation=noise_cancellation.BVCTelephony(),  # Temporarily disabled to test memory
+            close_on_disconnect=True,
         ),
     )
 
