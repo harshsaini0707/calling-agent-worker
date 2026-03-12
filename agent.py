@@ -58,8 +58,8 @@ class SarvamTTS:
 
 def _build_tts():
     """Configure the Text-to-Speech provider using Sarvam AI Bulbul."""
-    logger.info("Using Sarvam TTS: bulbul:v3, voice: simran")
-    return sarvam.TTS(target_language_code="hi-IN", model="bulbul:v3", speaker="simran", speech_sample_rate=8000)
+    logger.info("Using Sarvam TTS: bulbul:v3, voice: simran, lang: en-IN")
+    return sarvam.TTS(target_language_code="en-IN", model="bulbul:v3", speaker="simran", speech_sample_rate=8000)
 
 
 
