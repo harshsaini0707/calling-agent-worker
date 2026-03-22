@@ -5,13 +5,13 @@ import time
 import asyncio
 from dotenv import load_dotenv
 
-from livekit import agents, api
+from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
     cartesia,
     sarvam,
-    # noise_cancellation,  # Temporarily disabled to test memory usage
+     noise_cancellation,  
     silero,
 )
 from livekit.agents import llm
@@ -611,10 +611,14 @@ async def entrypoint(ctx: agents.JobContext):
         room=ctx.room,
         agent=agent,
         room_input_options=RoomInputOptions(
-            # noise_cancellation=noise_cancellation.BVCTelephony(),  # Temporarily disabled to test memory
+             noise_cancellation=noise_cancellation.BVCTelephony(), 
             close_on_disconnect=True,
         ),
     )
+
+    @ctx.room.on("participant_disconnected")
+    def on_participant_disconnected(participant: rtc.RemoteParticipant):
+        logger.info(f"Caller/Participant disconnected: {participant.identity}")
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
