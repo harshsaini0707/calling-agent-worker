@@ -4,7 +4,7 @@ import json
 import time
 import asyncio
 from dotenv import load_dotenv
-
+import aiohttp
 from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
@@ -29,7 +29,21 @@ logger = logging.getLogger("outbound-agent")
 # You can find this by running 'python setup_trunk.py --list' or checking LiveKit Dashboard
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
+BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 
+async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
+    if not schedule_id:
+        return
+    logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id}")
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {"scheduleId": schedule_id, "outcome": outcome}
+            if duration is not None:
+                payload["durationSec"] = duration
+            async with session.post(BACKEND_WEBHOOK_URL, json=payload) as resp:
+                logger.info(f"Webhook response: {resp.status}")
+    except Exception as e:
+        logger.error(f"Webhook failed: {e}")
 
 
 # Sarvam TTS integration wrapper
@@ -553,6 +567,7 @@ async def entrypoint(ctx: agents.JobContext):
     logger.info(f"Connecting to room: {ctx.room.name}")
     
     # parse metadata sent by the dispatch script (or API server)
+    schedule_id = None
     phone_number = None
     candidate_name = "Candidate"
     prompt_role = "Software Engineer"
@@ -563,6 +578,7 @@ async def entrypoint(ctx: agents.JobContext):
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
+            schedule_id = data.get("scheduleId")
             phone_number = data.get("phone_number")
             candidate_name = data.get("candidate_name", "Candidate")
             raw_prompt = data.get("prompt", "Software Engineer")
@@ -619,6 +635,12 @@ async def entrypoint(ctx: agents.JobContext):
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"Caller/Participant disconnected: {participant.identity}")
+        if schedule_id:
+            try:
+                duration = int(time.time() - agent._call_start_time)
+                asyncio.create_task(report_outcome(schedule_id, "COMPLETED", duration))
+            except Exception as e:
+                logger.error(f"Error sending disconnect webhook: {e}")
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
@@ -657,6 +679,9 @@ async def entrypoint(ctx: agents.JobContext):
                                 if phrase in text:
                                     logger.info(f"Farewell detected in agent message: '{phrase}' — hanging up in 2s")
                                     await asyncio.sleep(2)
+                                    if schedule_id:
+                                        duration = int(time.time() - agent._call_start_time)
+                                        await report_outcome(schedule_id, "COMPLETED", duration)
                                     await hangup_call()
                                     return
                     checked_count = len(messages)
@@ -697,6 +722,8 @@ async def entrypoint(ctx: agents.JobContext):
             
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")
+            if schedule_id:
+                await report_outcome(schedule_id, "NO_ANSWER")
             # Ensure we clean up if the call fails
             ctx.shutdown()
     else:
