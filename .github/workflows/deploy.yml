@@ -87,8 +87,8 @@ jobs:
                 "cd /home/ec2-user",
                 "echo TAG=${{ needs.build.outputs.sha_tag }} > .env",
                 "aws ecr get-login-password --region ${{ secrets.AWS_REGION }} | docker login --username AWS --password-stdin ${{ secrets.AWS_ECR_REGISTRY }}",
-                "docker-compose pull ta-0",
-                "docker-compose up -d ta-0",
+                "docker compose pull ta-0",
+                "docker compose up -d ta-0",
                 "docker image prune -af"
               ]
             }' \
