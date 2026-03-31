@@ -71,7 +71,21 @@ class SarvamTTS:
         return response
 
 def _build_tts():
-    """Configure the Text-to-Speech provider using Sarvam AI Bulbul."""
+    """Configure the Text-to-Speech provider (Sarvam or OpenAI)."""
+    provider = os.getenv("TTS_PROVIDER", "sarvam").strip().lower()
+
+    if provider == "openai":
+        model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
+        voice = os.getenv("OPENAI_TTS_VOICE", "ash")
+        instructions = os.getenv("OPENAI_TTS_INSTRUCTIONS", "").strip()
+
+        if instructions:
+            logger.info(f"Using OpenAI TTS: model={model} voice={voice} (with instructions)")
+            return openai.TTS(model=model, voice=voice, instructions=instructions)
+
+        logger.info(f"Using OpenAI TTS: model={model} voice={voice}")
+        return openai.TTS(model=model, voice=voice)
+
     logger.info("Using Sarvam TTS: bulbul:v3, voice: simran, lang: en-IN")
     return sarvam.TTS(target_language_code="en-IN", model="bulbul:v3", speaker="simran", speech_sample_rate=8000)
 
