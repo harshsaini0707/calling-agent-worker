@@ -1,135 +1,169 @@
-# LiveKit Outbound Calling Agent
+# Telephony Agent
 
-This project provides a production-ready solution for making outbound AI phone calls using LiveKit and Vobiz SIP trunks. The AI agent can place calls, wait for an answer, and hold a natural conversation with the recipient.
+The outbound voice-calling worker for the Resume Parser platform. This repo runs a long-lived LiveKit agent that receives dispatch jobs from the backend, places outbound calls over the SIP trunk, conducts AI-driven screening conversations, and reports outcomes back to the API.
 
-## 📂 Project Structure
+For overall platform onboarding, start with [`../README.md`](../README.md).
 
-| File | Description |
-|------|-------------|
-| `agent.py` | The main AI worker. It runs in the background, waits for dispatch jobs, and places outbound calls. |
-| `make_call.py` | A utility script to trigger calls. It dispatches the agent to a unique room with the target phone number. |
-| `setup_trunk.py` | Script to configure the LiveKit SIP Trunk with Vobiz credentials. |
-| `transfer_call.md` | Guide for configuring and using SIP transfers. |
-| `.env.example` | Template for environment variables and secrets. |
-| `requirements.txt` | List of Python dependencies. |
+## What This Repo Does
 
----
+- Connects to LiveKit as a worker named `outbound-caller`.
+- Waits for dispatch jobs created by the backend call-screening system.
+- Dials candidates through the configured outbound SIP trunk.
+- Builds a candidate-specific AI prompt using metadata from the dispatch payload.
+- Runs the screening conversation with speech recognition, LLM reasoning, and speech synthesis.
+- Supports transfer-to-human behavior when the prompt or tools request it.
+- Reports `COMPLETED` or `NO_ANSWER` outcomes to the backend webhook.
 
-## 🚀 Installation & Setup
+## Where This Fits In The System
 
-### 1. Prerequisites
-
-Ensure you have the following installed:
-- **Python 3.9+**
-- **uv** (recommended for fast package management) - [Install uv](https://github.com/astral-sh/uv)
-
-### 2. LiveKit & Vobiz Credentials
-
-You will need the following accounts:
-
-1.  **LiveKit Cloud Account**: Get your Project URL, API Key, and Secret from [cloud.livekit.io](https://cloud.livekit.io).
-2.  **Vobiz Account**:
-    *   Log in to the **Vobiz Console Platform**.
-    *   Navigate to your SIP Trunk settings to find:
-        *   SIP Domain (e.g., `xxx.sip.vobiz.ai`)
-        *   Username & Password
-    *   Get your DID Number (e.g., `+91...`).
-3.  **OpenAI / Deepgram Keys**:
-    *   OpenAI API Key (for LLM and optional TTS)
-    *   Deepgram API Key (for STT)
-
-### 3. Installation Steps
-
-1.  **Clone/Copy the project** to your local machine.
-2.  **Open a terminal** in the project folder (`livekit-outbound-calls`).
-3.  **Install dependencies** using `uv`:
-
-    ```powershell
-    # Create virtual environment
-    uv venv
-
-    # Install required packages
-    uv pip install -r requirements.txt
-    ```
-
-### 4. Configuration
-
-1.  **Create your env file**:
-    ```powershell
-    cp .env.example .env.local
-    ```
-2.  **Edit `.env.local`** and fill in your keys:
-    ```env
-    LIVEKIT_URL=wss://...
-    LIVEKIT_API_KEY=...
-    LIVEKIT_API_SECRET=...
-    OPENAI_API_KEY=...
-    DEEPGRAM_API_KEY=...
-    
-    # SIP Config
-    VOBIZ_SIP_DOMAIN=...
-    VOBIZ_USERNAME=...
-    VOBIZ_PASSWORD=...
-    VOBIZ_OUTBOUND_NUMBER=+91...
-    ```
-3.  **Set Trunk ID in `agent.py`**:
-    *   If you haven't created a trunk yet, you'll need to create one using the LiveKit CLI or setup script.
-    *   Once created, get the `TRUNK_ID` (starts with `ST_...`).
-    *   Open `agent.py` and update line 25:
-        ```python
-        OUTBOUND_TRUNK_ID = "ST_xxxxxxxxx"
-        ```
-
----
-
-## 📞 How to Use
-
-### Step 1: Start the Background Agent
-
-Open a PowerShell terminal and run:
-
-```powershell
-uv run python agent.py start
+```text
+Frontend
+  -> Backend creates CallBatch and CallSchedule rows
+  -> Backend Resque worker dispatches LiveKit job
+  -> This repo receives the dispatch
+  -> This repo places the outbound call
+  -> This repo POSTs call outcome back to backend webhook
 ```
 
-*   **Wait** until you see the message: `INFO:livekit.agents:registered worker ...`
-*   **Keep this terminal open.** This agent will listen for call requests.
+## Tech Stack
 
-### Step 2: Make a Call
+| Area | Choice |
+| --- | --- |
+| Runtime | Python 3.12 |
+| Container runtime | Docker |
+| Agent framework | LiveKit Agents SDK |
+| VAD | Silero |
+| STT | OpenAI via LiveKit plugin |
+| LLM | OpenAI via LiveKit plugin |
+| TTS | OpenAI TTS |
+| Telephony | LiveKit SIP + Vobiz trunk |
+| Webhook client | `aiohttp` |
 
-Open a **separate** terminal window (keep the first one running) and run:
+## File Guide
 
-```powershell
-uv run python make_call.py --to +919988776655 (your number)
+- `agent.py`: the main worker and almost all runtime behavior.
+- `make_call.py`: local utility to manually dispatch a test call.
+- `setup_trunk.py`: helper for updating the outbound SIP trunk details in LiveKit.
+- `Dockerfile`: container image used in deployment and local dev.
+- `docker-compose.yml`: recommended local development entrypoint for the worker.
+- `.env.example`: environment variable template.
+- `railway.toml`: Railway deployment configuration.
+- `transfer_call.md`: notes for transfer behavior and SIP transfer troubleshooting.
+- `plan.md`: implementation notes and known issues backlog.
+
+## `agent.py` Responsibilities
+
+`agent.py` is the core of the repo. It handles:
+
+- Loading environment variables from `.env`.
+- Starting the LiveKit worker process.
+- Receiving job metadata from the backend.
+- Creating the conversation session with speech and language providers.
+- Managing outbound dialing.
+- Detecting hang-up or farewell conditions.
+- Posting final call outcomes back to the backend.
+- Exposing the `transfer_call` tool to the LLM.
+
+Important metadata fields expected from the backend include:
+
+- `scheduleId`
+- `phone_number`
+- `candidate_name`
+- `prompt`
+- `resume`
+- `jd`
+- `total_minutes`
+- `templateQuestions`
+
+## Expected Contract With The Backend
+
+The backend dispatches this agent through LiveKit and expects a webhook back to:
+
+`/api/call-screening/webhook/call-outcome`
+
+Webhook payload shape:
+
+```json
+{
+  "scheduleId": "uuid",
+  "outcome": "COMPLETED",
+  "durationSec": 142
+}
 ```
 
-*(Replace `+919988776655` with the actual number you want to call)*
+If the worker cannot reach the backend webhook, call schedules in the backend will not close out correctly.
 
-### What Happens Next?
+## Environment Variables
 
-1.  `make_call.py` sends a "dispatch" request to LiveKit.
-2.  LiveKit assigns the job to your running `agent.py`.
-3.  The agent joins a secure room (e.g., `call-9148...`).
-4.  The agent dials the phone number via the Vobiz SIP trunk.
-5.  **When the user answers**, the agent will start listening and speaking.
-6.  **Call Transfer**: You can ask the agent to transfer you.
-    *   *Default*: "Transfer me." -> Transfers to the configured default number.
-    *   *Custom*: "Transfer me to +1..." -> Transfers to the specific number.
-    *   For detailed setup and troubleshooting, see [transfer_call.md](transfer_call.md).
+Core variables:
 
----
+- `LIVEKIT_URL`
+- `LIVEKIT_API_KEY`
+- `LIVEKIT_API_SECRET`
+- `OPENAI_API_KEY`
+- `OUTBOUND_TRUNK_ID`
+- `VOBIZ_SIP_DOMAIN`
+- `BACKEND_WEBHOOK_URL`
 
-## 🛠️ Troubleshooting
+Common optional/supporting variables:
 
-- **Agent not starting?**
-    - Check `.env.local` is correct.
-    - Ensure dependencies are installed (`uv pip install ...`).
+- `OPENAI_TTS_MODEL`
+- `OPENAI_TTS_VOICE`
+- `OPENAI_TTS_INSTRUCTIONS`
+- `DEFAULT_TRANSFER_NUMBER`
+- `VOBIZ_USERNAME`
+- `VOBIZ_PASSWORD`
+- `VOBIZ_OUTBOUND_NUMBER`
 
-- **Call not connecting?**
-    - Check `OUTBOUND_TRUNK_ID` in `agent.py`.
-    - Verify your Vobiz SIP credentials and balance.
-    - Ensure the phone number includes the country code (e.g., `+91`).
+Use `.env` in this repo, not `.env.local`.
 
-- **No audio?**
-    - Check OpenAI/Deepgram API keys.
-    - Check the agent logs for errors.
+## Local Development Policy
+
+This repo should run in Docker on developer machines. Do not rely on ad hoc host-level Python setups for normal team development.
+
+### Start the worker
+
+```bash
+docker compose up --build
+```
+
+### Stop the worker
+
+```bash
+docker compose down
+```
+
+The compose file mounts the repo into the container and loads variables from `.env`.
+
+## Local Development Notes
+
+- If the backend runs on your host machine, set `BACKEND_WEBHOOK_URL` to `http://host.docker.internal:4000/api/call-screening/webhook/call-outcome`.
+- Keep the backend running before testing the agent.
+- Keep a LiveKit project and SIP trunk configured for the credentials in your `.env`.
+- `make_call.py` is for direct agent dispatch testing and is separate from the normal backend-driven flow.
+
+## Manual Test Call
+
+With the worker already running:
+
+```bash
+docker compose exec telephony-agent python make_call.py --to +919999999999
+```
+
+This is only a quick connectivity test. Normal product testing should go through the backend and frontend call-screening workflow.
+
+## Deployment
+
+Production deployment is container-based:
+
+- Railway builds from `Dockerfile`.
+- The process is a long-lived worker, not an HTTP API server.
+- Environment variables must be set in Railway for the worker to function.
+
+## Troubleshooting
+
+- Worker starts but never receives jobs: check LiveKit URL/key/secret and confirm the backend dispatches `agent_name="outbound-caller"`.
+- Calls dispatch but webhook state never updates: check `BACKEND_WEBHOOK_URL` from inside the container.
+- SIP dialing fails: check `OUTBOUND_TRUNK_ID`, `VOBIZ_*` values, and trunk configuration.
+- Transfer behavior fails: check `DEFAULT_TRANSFER_NUMBER` and `VOBIZ_SIP_DOMAIN`.
+- No speech or bad speech behavior: verify OpenAI credentials and model-related envs.
