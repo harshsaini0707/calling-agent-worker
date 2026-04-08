@@ -81,6 +81,9 @@ The backend dispatches this agent through LiveKit and expects a webhook back to:
 
 `/api/call-screening/webhook/call-outcome`
 
+The webhook is now HMAC-signed. Configure the same `CALL_SCREENING_WEBHOOK_SECRET`
+in both the backend and this worker so outcome callbacks are accepted.
+
 Webhook payload shape:
 
 ```json

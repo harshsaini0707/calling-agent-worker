@@ -3,6 +3,8 @@ import os
 import json
 import time
 import asyncio
+import hmac
+import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
@@ -29,6 +31,7 @@ logger = logging.getLogger("outbound-agent")
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
+CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
 
 async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
     if not schedule_id:
@@ -39,7 +42,25 @@ async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
             payload = {"scheduleId": schedule_id, "outcome": outcome}
             if duration is not None:
                 payload["durationSec"] = duration
-            async with session.post(BACKEND_WEBHOOK_URL, json=payload) as resp:
+            body = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
+            timestamp = str(int(time.time()))
+            headers = {
+                "Content-Type": "application/json",
+                "X-Call-Screening-Timestamp": timestamp,
+            }
+
+            if CALL_SCREENING_WEBHOOK_SECRET:
+                signed_payload = f"{timestamp}.{body}".encode("utf-8")
+                signature = hmac.new(
+                    CALL_SCREENING_WEBHOOK_SECRET.encode("utf-8"),
+                    signed_payload,
+                    hashlib.sha256,
+                ).hexdigest()
+                headers["X-Call-Screening-Signature"] = f"sha256={signature}"
+            else:
+                logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
+
+            async with session.post(BACKEND_WEBHOOK_URL, data=body.encode("utf-8"), headers=headers) as resp:
                 logger.info(f"Webhook response: {resp.status}")
     except Exception as e:
         logger.error(f"Webhook failed: {e}")
