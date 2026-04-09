@@ -632,15 +632,54 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
 
+    # Track whether we already reported the outcome (to avoid duplicate webhooks)
+    outcome_reported = False
+
+    async def _safe_report(outcome: str, dur: int = None):
+        """Report outcome exactly once."""
+        nonlocal outcome_reported
+        if outcome_reported or not schedule_id:
+            return
+        outcome_reported = True
+        try:
+            await report_outcome(schedule_id, outcome, dur)
+        except Exception as e:
+            logger.error(f"Failed to report outcome: {e}")
+
+    # Helper to end the call gracefully
+    async def _end_call():
+        """Disconnect all SIP participants and shut down the agent context."""
+        try:
+            for p in ctx.room.remote_participants.values():
+                if p.identity.startswith("sip_"):
+                    logger.info(f"Removing SIP participant: {p.identity}")
+                    await ctx.api.room.remove_participant(
+                        api.RoomParticipantIdentity(room=ctx.room.name, identity=p.identity)
+                    )
+        except Exception as e:
+            logger.warning(f"Error removing participant: {e}")
+        ctx.shutdown()
+
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"Caller/Participant disconnected: {participant.identity}")
-        if schedule_id:
+        if schedule_id and not outcome_reported:
             try:
                 duration = int(time.time() - agent._call_start_time)
-                asyncio.create_task(report_outcome(schedule_id, "COMPLETED", duration))
+                asyncio.create_task(_safe_report("COMPLETED", duration))
             except Exception as e:
                 logger.error(f"Error sending disconnect webhook: {e}")
+
+    # Safety-net: when the agent session itself shuts down, always report outcome
+    @session.on("close")
+    def on_session_close():
+        logger.info("AgentSession closed — ensuring outcome is reported")
+        if not outcome_reported and schedule_id:
+            try:
+                duration = int(time.time() - agent._call_start_time)
+            except Exception:
+                duration = 0
+            asyncio.create_task(_safe_report("COMPLETED", duration))
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
@@ -679,10 +718,9 @@ async def entrypoint(ctx: agents.JobContext):
                                 if phrase in text:
                                     logger.info(f"Farewell detected in agent message: '{phrase}' — hanging up in 2s")
                                     await asyncio.sleep(2)
-                                    if schedule_id:
-                                        duration = int(time.time() - agent._call_start_time)
-                                        await report_outcome(schedule_id, "COMPLETED", duration)
-                                    await hangup_call()
+                                    duration = int(time.time() - agent._call_start_time)
+                                    await _safe_report("COMPLETED", duration)
+                                    await _end_call()
                                     return
                     checked_count = len(messages)
             except Exception as e:
