@@ -8,13 +8,25 @@ import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
+from livekit.agents import (
+    AgentSession,
+    Agent,
+    RoomInputOptions,
+    TurnHandlingOptions,
+    EndpointingOptions,
+    InterruptionOptions,
+    JobProcess,
+    get_job_context,
+    function_tool,
+    RunContext,
+)
 from livekit.plugins import (
     openai,
     sarvam,
     # noise_cancellation,  
     silero,
 )
+from livekit.plugins.turn_detector.multilingual import MultilingualModel
 from livekit.agents import llm
 from typing import Annotated, Optional
 
@@ -65,6 +77,13 @@ def validate_runtime_env():
         return False
 
     return True
+
+
+def prewarm(proc: JobProcess) -> None:
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.2,
+        min_silence_duration=0.4,
+    )
 
 async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
     if not schedule_id:
@@ -664,14 +683,24 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize the Agent Session with plugins
 
     session = AgentSession(
-        # Use Silero VAD (required for non-streaming STT)
-        vad=silero.VAD.load(),
+        # Use prewarmed Silero VAD for faster startup and tighter speech segmentation.
+        vad=ctx.proc.userdata["vad"],
         # Use OpenAI gpt-4o-mini-transcribe for STT
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
         # Use OpenAI GPT-5-nano for LLM
         llm=openai.LLM(model="gpt-5-nano"),
         # Use Sarvam bulbul:v3 ratan for TTS
         tts=_build_tts(),
+        turn_handling=TurnHandlingOptions(
+            turn_detection=MultilingualModel(),
+            endpointing=EndpointingOptions(
+                max_delay=1.5,
+            ),
+            interruption=InterruptionOptions(
+                min_duration=0.3,
+            ),
+        ),
+        preemptive_generation=True,
         userdata=fnc_ctx,
     )
 
@@ -842,6 +871,7 @@ if __name__ == "__main__":
     agents.cli.run_app(
         agents.WorkerOptions(
             entrypoint_fnc=entrypoint,
+            prewarm_fnc=prewarm,
             agent_name="outbound-caller", 
         )
     )

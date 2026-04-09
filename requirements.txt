@@ -1,12 +1,12 @@
-livekit-agents>=0.8.0
-livekit-api>=0.6.0
-livekit-plugins-openai>=0.6.0
-livekit-plugins-cartesia>=0.6.0
-livekit-plugins-deepgram>=0.6.0
-livekit-plugins-silero>=0.6.0
-livekit-plugins-noise-cancellation
-python-dotenv>=1.0.0
-aiohttp>=3.10.0
-fastapi>=0.110.0
-uvicorn[standard]>=0.27.0
-pydantic>=2.0.0
+# Core LiveKit agent framework.
+# Keep Sarvam installed separately from the Dockerfiles because this repo pins
+# the GitHub build that contains the output_audio_codec fix.
+livekit-agents[openai,silero,turn-detector]>=1.5.1,<2.0.0
+livekit-plugins-noise-cancellation>=0.2.5,<1.0.0
+
+# App/runtime dependencies
+python-dotenv>=1.0.0,<2.0.0
+aiohttp>=3.10.0,<4.0.0
+fastapi>=0.110.0,<1.0.0
+uvicorn[standard]>=0.27.0,<1.0.0
+pydantic>=2.0.0,<3.0.0
