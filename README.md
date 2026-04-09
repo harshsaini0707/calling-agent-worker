@@ -12,7 +12,7 @@ For overall platform onboarding, start with [`../README.md`](../README.md).
 - Builds a candidate-specific AI prompt using metadata from the dispatch payload.
 - Runs the screening conversation with speech recognition, LLM reasoning, and speech synthesis.
 - Supports transfer-to-human behavior when the prompt or tools request it.
-- Reports `COMPLETED` or `NO_ANSWER` outcomes to the backend webhook.
+- Reports terminal call outcomes back to the backend webhook.
 
 ## Where This Fits In The System
 
@@ -42,10 +42,13 @@ Frontend
 ## File Guide
 
 - `agent.py`: the main worker and almost all runtime behavior.
-- `make_call.py`: local utility to manually dispatch a test call.
+- `make_call.py`: utility to manually dispatch a test call from inside the running container.
 - `setup_trunk.py`: helper for updating the outbound SIP trunk details in LiveKit.
 - `Dockerfile`: container image used in deployment and local dev.
-- `docker-compose.yml`: recommended local development entrypoint for the worker.
+- `Dockerfile.local`: local-only Docker build for iterative development.
+- `docker-compose.local.yml`: required local development entrypoint for the worker.
+- `docker-compose.yml`: existing non-local compose entrypoint retained for compatibility.
+- `preflight.py`: local Docker preflight checks for env completeness and backend parity.
 - `.env.example`: environment variable template.
 - `railway.toml`: Railway deployment configuration.
 - `transfer_call.md`: notes for transfer behavior and SIP transfer troubleshooting.
@@ -127,22 +130,24 @@ This repo should run in Docker on developer machines. Do not rely on ad hoc host
 ### Start the worker
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.local.yml up --build
 ```
 
 ### Stop the worker
 
 ```bash
-docker compose down
+docker compose -f docker-compose.local.yml down
 ```
 
-The compose file mounts the repo into the container and loads variables from `.env`.
+The local compose file mounts the repo into the container, reads `.env`, and runs a preflight check before starting the worker.
 
 ## Local Development Notes
 
 - If the backend runs on your host machine, set `BACKEND_WEBHOOK_URL` to `http://host.docker.internal:4000/api/call-screening/webhook/call-outcome`.
 - Keep the backend running before testing the agent.
 - Keep a LiveKit project and SIP trunk configured for the credentials in your `.env`.
+- Local Docker preflight checks only for required telephony env presence and Docker-safe webhook URL shape.
+- Do not run the worker directly with host Python in local development.
 - `make_call.py` is for direct agent dispatch testing and is separate from the normal backend-driven flow.
 
 ## Manual Test Call
@@ -150,7 +155,7 @@ The compose file mounts the repo into the container and loads variables from `.e
 With the worker already running:
 
 ```bash
-docker compose exec telephony-agent python make_call.py --to +919999999999
+docker compose -f docker-compose.local.yml exec telephony-agent-local python make_call.py --to +919999999999
 ```
 
 This is only a quick connectivity test. Normal product testing should go through the backend and frontend call-screening workflow.

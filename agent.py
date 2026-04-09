@@ -33,6 +33,38 @@ SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN")
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
 
+REQUIRED_RUNTIME_ENV_KEYS = [
+    "LIVEKIT_URL",
+    "LIVEKIT_API_KEY",
+    "LIVEKIT_API_SECRET",
+    "OPENAI_API_KEY",
+    "OUTBOUND_TRUNK_ID",
+    "BACKEND_WEBHOOK_URL",
+]
+
+
+def get_missing_runtime_env_keys():
+    return [key for key in REQUIRED_RUNTIME_ENV_KEYS if not str(os.getenv(key, "")).strip()]
+
+
+def validate_runtime_env():
+    missing_keys = get_missing_runtime_env_keys()
+    if missing_keys:
+        logger.error(
+            "Telephony agent runtime configuration is incomplete. Missing: %s",
+            ", ".join(missing_keys),
+        )
+        return False
+
+    if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
+        logger.error(
+            "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
+            BACKEND_WEBHOOK_URL,
+        )
+        return False
+
+    return True
+
 async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
     if not schedule_id:
         return
@@ -569,6 +601,11 @@ async def entrypoint(ctx: agents.JobContext):
     4. Waits for answer before speaking.
     """
     logger.info(f"Connecting to room: {ctx.room.name}")
+
+    if not validate_runtime_env():
+        logger.error("Shutting down telephony job because required runtime env validation failed")
+        ctx.shutdown()
+        return
     
     # parse metadata sent by the dispatch script (or API server)
     schedule_id = None
@@ -590,14 +627,13 @@ async def entrypoint(ctx: agents.JobContext):
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
 
-            # If the prompt is long (>100 chars), treat it as a custom prompt.
-            # Short values like "Software Engineer" are just role titles → use default prompt.
-            if len(raw_prompt.strip()) > 100:
-                prompt_text = raw_prompt
+            normalized_prompt = str(raw_prompt or "").strip()
+            if normalized_prompt:
+                prompt_text = normalized_prompt
                 prompt_role = "Custom"
             else:
                 prompt_text = ""
-                prompt_role = raw_prompt or "Software Engineer"
+                prompt_role = "Software Engineer"
     except Exception:
         logger.warning("No valid JSON metadata found. This might be an inbound call.")
 
@@ -735,6 +771,12 @@ async def entrypoint(ctx: agents.JobContext):
 
     if phone_number:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
+        if not OUTBOUND_TRUNK_ID:
+            logger.error("OUTBOUND_TRUNK_ID is missing. Cannot place outbound SIP call.")
+            if schedule_id:
+                await report_outcome(schedule_id, "FAILED")
+            ctx.shutdown()
+            return
         try:
             # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(

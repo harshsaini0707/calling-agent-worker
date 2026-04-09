@@ -34,7 +34,10 @@ This repo does own:
 - `make_call.py`: manual dispatch utility for quick testing.
 - `setup_trunk.py`: trunk update helper.
 - `Dockerfile`: container image definition.
-- `docker-compose.yml`: required local development path.
+- `Dockerfile.local`: local-only Docker build for iterative development.
+- `docker-compose.local.yml`: required local development path.
+- `docker-compose.yml`: compatibility compose file kept alongside the local variant.
+- `preflight.py`: local env existence and Docker-safe webhook checks.
 - `.env.example`: variable template.
 
 ## Provider Stack In Code
@@ -55,7 +58,7 @@ Run this repo in Docker on dev machines.
 Expected workflow:
 
 ```bash
-docker compose up --build
+docker compose -f docker-compose.local.yml up --build
 ```
 
 Use `.env`, not `.env.local`.
@@ -90,7 +93,7 @@ Webhook payload sent back by this repo:
 ```json
 {
   "scheduleId": "uuid",
-  "outcome": "COMPLETED" | "NO_ANSWER",
+  "outcome": "COMPLETED" | "NO_ANSWER" | "FAILED" | "BUSY" | "VOICEMAIL",
   "durationSec": 142
 }
 ```
