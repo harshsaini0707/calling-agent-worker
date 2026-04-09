@@ -10,6 +10,7 @@ from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_contex
 from livekit.plugins import (
     openai,
     cartesia,
+    sarvam,
     # noise_cancellation,  
     silero,
 )
@@ -45,18 +46,34 @@ async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
         logger.error(f"Webhook failed: {e}")
 
 
+# Sarvam TTS integration wrapper
+class SarvamTTS:
+    def on(self, event, callback):
+        # Dummy event handler for LiveKit compatibility
+        pass
+
+    def __init__(self, api_key, target_language_code="hi-IN"):
+        self.client = SarvamAI(api_subscription_key=api_key)
+        self.target_language_code = target_language_code
+        # LiveKit expects a capabilities attribute with streaming property
+        self.capabilities = type("Capabilities", (), {"streaming": False})()
+        # LiveKit expects a sample_rate attribute (e.g., 8000 Hz or as per Sarvam API)
+        self.sample_rate = 8000  # Set to Sarvam's actual sample rate if known
+        # LiveKit expects a num_channels attribute (e.g., 1 for mono audio)
+        self.num_channels = 1
+
+    async def synthesize(self, text, conn_options=None, **kwargs):
+        response = self.client.text_to_speech.convert(
+            text=text,
+            target_language_code=self.target_language_code
+        )
+        # The response may contain audio content or a URL, depending on Sarvam API
+        return response
+
 def _build_tts():
-    """Configure the Text-to-Speech provider using OpenAI TTS only."""
-    model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-    voice = os.getenv("OPENAI_TTS_VOICE", "ash")
-    instructions = os.getenv("OPENAI_TTS_INSTRUCTIONS", "").strip()
-
-    if instructions:
-        logger.info(f"Using OpenAI TTS: model={model} voice={voice} (with instructions)")
-        return openai.TTS(model=model, voice=voice, instructions=instructions)
-
-    logger.info(f"Using OpenAI TTS: model={model} voice={voice}")
-    return openai.TTS(model=model, voice=voice)
+    """Configure the Text-to-Speech provider using Sarvam AI Bulbul."""
+    logger.info("Using Sarvam TTS: bulbul:v3, voice: simran, lang: en-IN")
+    return sarvam.TTS(target_language_code="en-IN", model="bulbul:v3", speaker="simran", speech_sample_rate=8000)
 
 
 
