@@ -35,7 +35,7 @@ Frontend
 | VAD | Silero |
 | STT | OpenAI via LiveKit plugin |
 | LLM | OpenAI via LiveKit plugin |
-| TTS | OpenAI TTS |
+| TTS | Sarvam Bulbul via LiveKit plugin |
 | Telephony | LiveKit SIP + Vobiz trunk |
 | Webhook client | `aiohttp` |
 
@@ -48,7 +48,7 @@ Frontend
 - `Dockerfile.local`: local-only Docker build for iterative development.
 - `docker-compose.local.yml`: required local development entrypoint for the worker.
 - `docker-compose.yml`: existing non-local compose entrypoint retained for compatibility.
-- `preflight.py`: local Docker preflight checks for env completeness and backend parity.
+- `preflight.py`: local Docker preflight checks for env completeness and Docker-safe webhook URL shape.
 - `.env.example`: environment variable template.
 - `railway.toml`: Railway deployment configuration.
 - `transfer_call.md`: notes for transfer behavior and SIP transfer troubleshooting.
@@ -107,15 +107,16 @@ Core variables:
 - `LIVEKIT_API_KEY`
 - `LIVEKIT_API_SECRET`
 - `OPENAI_API_KEY`
+- `SARVAM_API_KEY`
 - `OUTBOUND_TRUNK_ID`
 - `VOBIZ_SIP_DOMAIN`
 - `BACKEND_WEBHOOK_URL`
 
 Common optional/supporting variables:
 
-- `OPENAI_TTS_MODEL`
-- `OPENAI_TTS_VOICE`
-- `OPENAI_TTS_INSTRUCTIONS`
+- `SARVAM_TTS_SPEAKER`
+- `SARVAM_TTS_LANGUAGE`
+- `SARVAM_TTS_PACE`
 - `DEFAULT_TRANSFER_NUMBER`
 - `VOBIZ_USERNAME`
 - `VOBIZ_PASSWORD`
@@ -174,4 +175,4 @@ Production deployment is container-based:
 - Calls dispatch but webhook state never updates: check `BACKEND_WEBHOOK_URL` from inside the container.
 - SIP dialing fails: check `OUTBOUND_TRUNK_ID`, `VOBIZ_*` values, and trunk configuration.
 - Transfer behavior fails: check `DEFAULT_TRANSFER_NUMBER` and `VOBIZ_SIP_DOMAIN`.
-- No speech or bad speech behavior: verify OpenAI credentials and model-related envs.
+- No speech or bad speech behavior: verify `SARVAM_API_KEY`, the selected Sarvam speaker/language envs, and OpenAI STT/LLM credentials.

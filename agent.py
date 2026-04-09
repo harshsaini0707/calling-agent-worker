@@ -11,7 +11,7 @@ from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
-    cartesia,
+    sarvam,
     # noise_cancellation,  
     silero,
 )
@@ -38,6 +38,7 @@ REQUIRED_RUNTIME_ENV_KEYS = [
     "LIVEKIT_API_KEY",
     "LIVEKIT_API_SECRET",
     "OPENAI_API_KEY",
+    "SARVAM_API_KEY",
     "OUTBOUND_TRUNK_ID",
     "BACKEND_WEBHOOK_URL",
 ]
@@ -98,18 +99,38 @@ async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
         logger.error(f"Webhook failed: {e}")
 
 
+def get_bulbul_model(speaker: str) -> str:
+    v2_speakers = {"anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh"}
+    return "bulbul:v2" if speaker in v2_speakers else "bulbul:v3-beta"
+
+
 def _build_tts():
-    """Configure the Text-to-Speech provider using OpenAI TTS only."""
-    model = os.getenv("OPENAI_TTS_MODEL", "gpt-4o-mini-tts")
-    voice = os.getenv("OPENAI_TTS_VOICE", "ash")
-    instructions = os.getenv("OPENAI_TTS_INSTRUCTIONS", "").strip()
+    """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
+    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+    language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
+    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
 
-    if instructions:
-        logger.info(f"Using OpenAI TTS: model={model} voice={voice} (with instructions)")
-        return openai.TTS(model=model, voice=voice, instructions=instructions)
+    try:
+        pace = float(pace_raw)
+    except ValueError:
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
+        pace = 0.95
 
-    logger.info(f"Using OpenAI TTS: model={model} voice={voice}")
-    return openai.TTS(model=model, voice=voice)
+    model = get_bulbul_model(speaker)
+    logger.info(
+        "Using Sarvam TTS: model=%s speaker=%s language=%s pace=%s",
+        model,
+        speaker,
+        language_code,
+        pace,
+    )
+    return sarvam.TTS(
+        target_language_code=language_code,
+        model=model,
+        speaker=speaker,
+        pace=pace,
+        output_audio_codec="mp3",
+    )
 
 
 
