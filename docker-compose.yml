@@ -1,0 +1,12 @@
+services:
+  telephony-agent:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    working_dir: /app
+    command: ["python", "agent.py", "start"]
+    volumes:
+      - .:/app
+    restart: unless-stopped

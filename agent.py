@@ -32,7 +32,40 @@ logger = logging.getLogger("outbound-agent")
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
-CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET")
+CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
+
+REQUIRED_RUNTIME_ENV_KEYS = [
+    "LIVEKIT_URL",
+    "LIVEKIT_API_KEY",
+    "LIVEKIT_API_SECRET",
+    "OPENAI_API_KEY",
+    "SARVAM_API_KEY",
+    "OUTBOUND_TRUNK_ID",
+    "BACKEND_WEBHOOK_URL",
+]
+
+
+def get_missing_runtime_env_keys():
+    return [key for key in REQUIRED_RUNTIME_ENV_KEYS if not str(os.getenv(key, "")).strip()]
+
+
+def validate_runtime_env():
+    missing_keys = get_missing_runtime_env_keys()
+    if missing_keys:
+        logger.error(
+            "Telephony agent runtime configuration is incomplete. Missing: %s",
+            ", ".join(missing_keys),
+        )
+        return False
+
+    if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
+        logger.error(
+            "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
+            BACKEND_WEBHOOK_URL,
+        )
+        return False
+
+    return True
 
 def _get_messages(session):
     """Safely extract messages from session depending on LiveKit version."""
@@ -94,58 +127,66 @@ async def report_outcome(
                 payload["callUuid"] = call_uuid
             if transcript:
                 payload["transcript"] = transcript
-            
+
             # Serialize payload to match EXACT bytes sent over the wire
-            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+            payload_bytes = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
             
-            headers = {"Content-Type": "application/json"}
+            timestamp_sec = int(time.time())
+            headers = {
+                "Content-Type": "application/json",
+                "X-Call-Screening-Timestamp": str(timestamp_sec),
+            }
+
             if CALL_SCREENING_WEBHOOK_SECRET:
-                timestamp_sec = int(time.time())
                 msg = f"{timestamp_sec}.".encode('utf-8') + payload_bytes
                 signature = hmac.new(
                     CALL_SCREENING_WEBHOOK_SECRET.encode('utf-8'),
                     msg,
                     hashlib.sha256
                 ).hexdigest()
-                
-                headers["x-call-screening-timestamp"] = str(timestamp_sec)
-                headers["x-call-screening-signature"] = f"sha256={signature}"
+                headers["X-Call-Screening-Signature"] = f"sha256={signature}"
+            else:
+                logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
 
             async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers) as resp:
-                body = await resp.text()
-                logger.info(f"Webhook response: {resp.status} — {body[:200]}")
+                response_body = await resp.text()
+                logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
     except Exception as e:
         logger.error(f"Webhook failed: {e}")
 
 
-# Sarvam TTS integration wrapper
-class SarvamTTS:
-    def on(self, event, callback):
-        # Dummy event handler for LiveKit compatibility
-        pass
+def get_bulbul_model(speaker: str) -> str:
+    v2_speakers = {"anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh"}
+    return "bulbul:v2" if speaker in v2_speakers else "bulbul:v3-beta"
 
-    def __init__(self, api_key, target_language_code="hi-IN"):
-        self.client = SarvamAI(api_subscription_key=api_key)
-        self.target_language_code = target_language_code
-        # LiveKit expects a capabilities attribute with streaming property
-        self.capabilities = type("Capabilities", (), {"streaming": False})()
-        # LiveKit expects a sample_rate attribute (e.g., 8000 Hz or as per Sarvam API)
-        self.sample_rate = 8000  # Set to Sarvam's actual sample rate if known
-        # LiveKit expects a num_channels attribute (e.g., 1 for mono audio)
-        self.num_channels = 1
-
-    async def synthesize(self, text, conn_options=None, **kwargs):
-        response = self.client.text_to_speech.convert(
-            text=text,
-            target_language_code=self.target_language_code
-        )
-        # The response may contain audio content or a URL, depending on Sarvam API
-        return response
 
 def _build_tts():
-    """Configure the Text-to-Speech provider using Sarvam AI Bulbul."""
-    logger.info("Using Sarvam TTS: bulbul:v3, voice: simran, lang: en-IN")
-    return sarvam.TTS(target_language_code="en-IN", model="bulbul:v3", speaker="simran", speech_sample_rate=8000)
+    """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
+    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+    language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
+    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+
+    try:
+        pace = float(pace_raw)
+    except ValueError:
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
+        pace = 0.95
+
+    model = get_bulbul_model(speaker)
+    logger.info(
+        "Using Sarvam TTS: model=%s speaker=%s language=%s pace=%s",
+        model,
+        speaker,
+        language_code,
+        pace,
+    )
+    return sarvam.TTS(
+        target_language_code=language_code,
+        model=model,
+        speaker=speaker,
+        pace=pace,
+        output_audio_codec="mp3",
+    )
 
 
 
@@ -637,6 +678,11 @@ async def entrypoint(ctx: agents.JobContext):
     4. Waits for answer before speaking.
     """
     logger.info(f"Connecting to room: {ctx.room.name}")
+
+    if not validate_runtime_env():
+        logger.error("Shutting down telephony job because required runtime env validation failed")
+        ctx.shutdown()
+        return
     
     # parse metadata sent by the dispatch script (or API server)
     schedule_id = None
@@ -658,14 +704,13 @@ async def entrypoint(ctx: agents.JobContext):
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
 
-            # If the prompt is long (>100 chars), treat it as a custom prompt.
-            # Short values like "Software Engineer" are just role titles → use default prompt.
-            if len(raw_prompt.strip()) > 100:
-                prompt_text = raw_prompt
+            normalized_prompt = str(raw_prompt or "").strip()
+            if normalized_prompt:
+                prompt_text = normalized_prompt
                 prompt_role = "Custom"
             else:
                 prompt_text = ""
-                prompt_role = raw_prompt or "Software Engineer"
+                prompt_role = "Software Engineer"
     except Exception:
         logger.warning("No valid JSON metadata found. This might be an inbound call.")
 
@@ -845,6 +890,12 @@ async def entrypoint(ctx: agents.JobContext):
 
     if phone_number:
         logger.info(f"Initiating outbound SIP call to {phone_number}...")
+        if not OUTBOUND_TRUNK_ID:
+            logger.error("OUTBOUND_TRUNK_ID is missing. Cannot place outbound SIP call.")
+            if schedule_id:
+                await report_outcome(schedule_id, "FAILED")
+            ctx.shutdown()
+            return
         try:
             # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(

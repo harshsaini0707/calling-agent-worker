@@ -1,0 +1,22 @@
+services:
+  telephony-agent-local:
+    build:
+      context: .
+      dockerfile: Dockerfile.local
+    image: telephony-agent:local
+    container_name: telephony-agent-local
+    env_file:
+      - .env
+    environment:
+      - PYTHONUNBUFFERED=1
+    command: >
+      sh -c "
+      python preflight.py &&
+      python agent.py start
+      "
+    working_dir: /app
+    volumes:
+      - .:/app
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
