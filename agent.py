@@ -3,6 +3,8 @@ import os
 import json
 import time
 import asyncio
+import hmac
+import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
@@ -30,18 +32,88 @@ logger = logging.getLogger("outbound-agent")
 OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
+CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET")
 
-async def report_outcome(schedule_id: str, outcome: str, duration: int = None):
+def _get_messages(session):
+    """Safely extract messages from session depending on LiveKit version."""
+    try:
+        if hasattr(session, 'history'):
+            if hasattr(session.history, 'messages'):
+                return session.history.messages() if callable(session.history.messages) else session.history.messages
+            elif callable(session.history):
+                h = session.history()
+                if hasattr(h, 'messages'):
+                    return h.messages() if callable(h.messages) else h.messages
+        elif hasattr(session, 'chat_ctx') and hasattr(session.chat_ctx, 'messages'):
+            return session.chat_ctx.messages() if callable(session.chat_ctx.messages) else session.chat_ctx.messages
+    except Exception as e:
+        logger.debug(f"Error getting messages: {e}")
+    return []
+
+def _collect_transcript(session) -> list:
+    """Extract full conversation as [{role, text}] from session history."""
+    transcript = []
+    try:
+        messages = _get_messages(session)
+        for msg in messages:
+            text = ""
+            if hasattr(msg, "content") and isinstance(msg.content, str):
+                text = msg.content
+            elif hasattr(msg, "text_content"):
+                text = msg.text_content
+            else:
+                text = str(msg)
+            text = text.strip()
+            if text:
+                role = getattr(msg, "role", "unknown")
+                # Normalise LiveKit role names to agent/user
+                if role == "assistant":
+                    role = "agent"
+                transcript.append({"role": role, "text": text})
+    except Exception as e:
+        logger.warning(f"Could not collect transcript: {e}")
+    return transcript
+
+
+async def report_outcome(
+    schedule_id: str,
+    outcome: str,
+    duration: int = None,
+    call_uuid: str = None,
+    transcript: list = None,
+):
     if not schedule_id:
         return
     logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id}")
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession() as http_session:
             payload = {"scheduleId": schedule_id, "outcome": outcome}
             if duration is not None:
                 payload["durationSec"] = duration
-            async with session.post(BACKEND_WEBHOOK_URL, json=payload) as resp:
-                logger.info(f"Webhook response: {resp.status}")
+            if call_uuid:
+                payload["callUuid"] = call_uuid
+            if transcript:
+                payload["transcript"] = transcript
+            
+            # Serialize payload to match EXACT bytes sent over the wire
+            payload_bytes = json.dumps(payload, separators=(',', ':')).encode('utf-8')
+            
+            headers = {"Content-Type": "application/json"}
+            if CALL_SCREENING_WEBHOOK_SECRET:
+                timestamp_sec = int(time.time())
+                msg = f"{timestamp_sec}.".encode('utf-8') + payload_bytes
+                signature = hmac.new(
+                    CALL_SCREENING_WEBHOOK_SECRET.encode('utf-8'),
+                    msg,
+                    hashlib.sha256
+                ).hexdigest()
+                
+                headers["x-call-screening-timestamp"] = str(timestamp_sec)
+                headers["x-call-screening-signature"] = f"sha256={signature}"
+
+            async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers) as resp:
+                body = await resp.text()
+                logger.info(f"Webhook response: {resp.status} — {body[:200]}")
     except Exception as e:
         logger.error(f"Webhook failed: {e}")
 
@@ -634,15 +706,57 @@ async def entrypoint(ctx: agents.JobContext):
 
     # Track whether we already reported the outcome (to avoid duplicate webhooks)
     outcome_reported = False
+    sip_call_uuid = None  # Vobiz call_uuid captured from SIP participant attributes
+
+    @ctx.room.on("participant_connected")
+    def on_participant_connected(participant: rtc.RemoteParticipant):
+        """Capture the Vobiz call_uuid from SIP participant attributes as soon as it joins."""
+        nonlocal sip_call_uuid
+        try:
+            attrs = participant.attributes or {}
+            identity = participant.identity or ""
+            metadata = participant.metadata or ""
+            
+
+            # logger.info(f"=== SIP PARTICIPANT CONNECTED ===")
+            # logger.info(f"  Identity: {identity}")
+            # logger.info(f"  Metadata: {metadata}")
+            # logger.info(f"  All attributes ({len(attrs)} keys):")
+            for key, value in attrs.items():
+                logger.info(f"    {key} = {value}")
+            # logger.info(f"====")
+            
+            # Try known key names for the Vobiz call UUID
+            for key in ("sip.callId", "sip.callID", "sip.call_id", 
+                         "sip.callUUID", "sip.call_uuid",
+                         "sip.trunkCallId", "sip.extra.X-Call-UUID",
+                         "sip.extra.X-Call-Id", "callId", "call_uuid"):
+                if key in attrs:
+                    sip_call_uuid = attrs[key]
+                    logger.info(f"Captured Vobiz call_uuid from '{key}': {sip_call_uuid}")
+                    break
+            
+            if not sip_call_uuid:
+                logger.warning(f"Could not find call_uuid in any known attribute key")
+        except Exception as e:
+            logger.warning(f"Could not capture call_uuid: {e}")
 
     async def _safe_report(outcome: str, dur: int = None):
-        """Report outcome exactly once."""
+        """Report outcome exactly once — includes transcript and call_uuid."""
         nonlocal outcome_reported
         if outcome_reported or not schedule_id:
             return
         outcome_reported = True
         try:
-            await report_outcome(schedule_id, outcome, dur)
+            transcript = _collect_transcript(session)
+            logger.info(f"Collected transcript with {len(transcript)} turns")
+            await report_outcome(
+                schedule_id,
+                outcome,
+                duration=dur,
+                call_uuid=sip_call_uuid,
+                transcript=transcript,
+            )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
 
@@ -701,8 +815,8 @@ async def entrypoint(ctx: agents.JobContext):
         while True:
             await asyncio.sleep(1.5)
             try:
-                messages = session.history.messages
-                if len(messages) > checked_count:
+                messages = _get_messages(session)
+                if messages and len(messages) > checked_count:
                     for msg in messages[checked_count:]:
                         if msg.role == "assistant":
                             text = ""
