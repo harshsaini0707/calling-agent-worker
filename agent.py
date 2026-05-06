@@ -164,36 +164,36 @@ def get_bulbul_model(speaker: str) -> str:
 def _build_tts():
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
 
-    return smallestai.TTS(
-        voice_id="yuvika",
-        language="en-IN"
+    # return smallestai.TTS(
+    #     voice_id="yuvika",
+    #     language="en-IN"
+    # )
+
+    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+    language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
+    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+
+    try:
+        pace = float(pace_raw)
+    except ValueError:
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
+        pace = 0.95
+
+    model = get_bulbul_model(speaker)
+    logger.info(
+        "Using Sarvam TTS: model=%s speaker=%s language=%s pace=%s",
+        model,
+        speaker,
+        language_code,
+        pace,
     )
-
-    # speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
-    # language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
-    # pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
-
-    # try:
-    #     pace = float(pace_raw)
-    # except ValueError:
-    #     logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
-    #     pace = 0.95
-
-    # model = get_bulbul_model(speaker)
-    # logger.info(
-    #     "Using Sarvam TTS: model=%s speaker=%s language=%s pace=%s",
-    #     model,
-    #     speaker,
-    #     language_code,
-    #     pace,
-    # )
-    # return sarvam.TTS(
-    #     target_language_code=language_code,
-    #     model=model,
-    #     speaker=speaker,
-    #     pace=pace,
-    #     output_audio_codec="mp3",
-    # )
+    return sarvam.TTS(
+        target_language_code=language_code,
+        model=model,
+        speaker=speaker,
+        pace=pace,
+        output_audio_codec="mp3",
+    )
 
 
 
