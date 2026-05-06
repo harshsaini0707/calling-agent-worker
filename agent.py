@@ -163,7 +163,7 @@ def get_bulbul_model(speaker: str) -> str:
 
 def _build_tts():
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
-    
+
     return smallestai.TTS(
         voice_id="yuvika",
         language="en-IN"
@@ -732,7 +732,7 @@ async def entrypoint(ctx: agents.JobContext):
         # Use OpenAI gpt-4o-mini-transcribe for STT
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
         # Use OpenAI GPT-5.4-mini for LLM
-        llm=openai.LLM(model="gpt-5.4-mini"),
+        llm=openai.LLM(model="gpt-5.4-nano"),
         # Use Sarvam bulbul:v3 ratan for TTS
         tts=_build_tts(),
         userdata=fnc_ctx,
