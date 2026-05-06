@@ -11,9 +11,9 @@ from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
-    smallestai,
+    # smallestai,
     # cartesia,
-    # sarvam,
+    sarvam,
     # noise_cancellation,  
     silero,
 )
