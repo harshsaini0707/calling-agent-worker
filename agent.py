@@ -164,12 +164,9 @@ def get_bulbul_model(speaker: str) -> str:
 def _build_tts():
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
     
-    pace = 0.95  # Default pace
-    
     return smallestai.TTS(
         voice_id="yuvika",
-        language="en-IN",
-        pace=pace
+        language="en-IN"
     )
 
     # speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
