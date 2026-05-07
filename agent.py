@@ -14,6 +14,7 @@ from livekit.plugins import (
     # smallestai,
     # cartesia,
     sarvam,
+    anthropic,
     # noise_cancellation,  
     silero,
 )
@@ -732,7 +733,8 @@ async def entrypoint(ctx: agents.JobContext):
         # Use OpenAI gpt-4o-mini-transcribe for STT
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
         # Use OpenAI GPT-5.4-mini for LLM
-        llm=openai.LLM(model="gpt-5.4-nano"),
+        # llm=openai.LLM(model="gpt-5.4-nano"),
+        llm=anthropic.LLM(model="claude-haiku-4-5"),
         # Use Sarvam bulbul:v3 ratan for TTS
         tts=_build_tts(),
         userdata=fnc_ctx,
