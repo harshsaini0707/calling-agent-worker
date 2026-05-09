@@ -87,6 +87,10 @@ Typical metadata includes:
 - `jd`
 - `total_minutes`
 - `templateQuestions`
+- `sttModel` (`openai` default, `deepgram` supported when configured)
+- `ttsProvider` (`sarvam` default; unsupported values fall back to Sarvam)
+- `ttsVoiceId` (Sarvam speaker id, defaults to `simran`)
+- `llmModel` (`claude-haiku-4-5` default; `gpt-*` routes to OpenAI)
 
 Webhook payload sent back by this repo:
 

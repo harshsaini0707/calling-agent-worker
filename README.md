@@ -77,6 +77,10 @@ Important metadata fields expected from the backend include:
 - `jd`
 - `total_minutes`
 - `templateQuestions`
+- `sttModel` (`openai` default, `deepgram` supported when `DEEPGRAM_API_KEY` is set)
+- `ttsProvider` (`sarvam` default; unsupported providers fall back to Sarvam)
+- `ttsVoiceId` (Sarvam speaker id, defaults to `simran`)
+- `llmModel` (`claude-haiku-4-5` default; `gpt-*` routes to OpenAI)
 
 ## Expected Contract With The Backend
 
@@ -117,6 +121,12 @@ Common optional/supporting variables:
 - `SARVAM_TTS_SPEAKER`
 - `SARVAM_TTS_LANGUAGE`
 - `SARVAM_TTS_PACE`
+- `DEFAULT_STT_PROVIDER`
+- `OPENAI_STT_MODEL`
+- `DEEPGRAM_API_KEY`
+- `DEEPGRAM_STT_MODEL`
+- `DEFAULT_LLM_MODEL`
+- `DEFAULT_TTS_PROVIDER`
 - `DEFAULT_TRANSFER_NUMBER`
 - `VOBIZ_USERNAME`
 - `VOBIZ_PASSWORD`

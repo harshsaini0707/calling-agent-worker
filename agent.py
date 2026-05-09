@@ -11,6 +11,7 @@ from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
+    deepgram,
     # smallestai,
     # cartesia,
     sarvam,
@@ -35,6 +36,14 @@ OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
+DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "openai").strip() or "openai"
+DEFAULT_OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+DEFAULT_DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3").strip() or "nova-3"
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
+DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "sarvam").strip() or "sarvam"
+DEFAULT_TTS_VOICE_ID = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+DEFAULT_TTS_LANGUAGE = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
+DEFAULT_TTS_PACE = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
 
 REQUIRED_RUNTIME_ENV_KEYS = [
     "LIVEKIT_URL",
@@ -162,7 +171,45 @@ def get_bulbul_model(speaker: str) -> str:
     return "bulbul:v2" if speaker in v2_speakers else "bulbul:v3-beta"
 
 
-def _build_tts():
+def _coerce_tts_pace(value: str) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", value)
+        return 0.95
+
+
+def _build_stt(stt_model: str | None):
+    normalized = (stt_model or DEFAULT_STT_PROVIDER).strip().lower()
+    if normalized == "deepgram":
+        if os.getenv("DEEPGRAM_API_KEY"):
+            logger.info("Using Deepgram STT: model=%s language=en-IN", DEFAULT_DEEPGRAM_STT_MODEL)
+            return deepgram.STT(model=DEFAULT_DEEPGRAM_STT_MODEL, language="en-IN")
+        logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
+    elif normalized != "openai":
+        logger.warning("Unsupported STT provider requested: %s. Falling back to OpenAI.", stt_model)
+
+    logger.info("Using OpenAI STT: model=%s language=en", DEFAULT_OPENAI_STT_MODEL)
+    return openai.STT(model=DEFAULT_OPENAI_STT_MODEL, language="en")
+
+
+def _build_llm(llm_model: str | None):
+    model = (llm_model or DEFAULT_LLM_MODEL).strip() or DEFAULT_LLM_MODEL
+    normalized = model.lower()
+
+    if normalized.startswith("gpt-"):
+        logger.info("Using OpenAI LLM: model=%s", model)
+        return openai.LLM(model=model)
+
+    if normalized.startswith("gemini"):
+        logger.warning("Gemini LLM requested but this worker has no Google plugin configured; falling back to %s.", DEFAULT_LLM_MODEL)
+        model = DEFAULT_LLM_MODEL
+
+    logger.info("Using Anthropic LLM: model=%s", model)
+    return anthropic.LLM(model=model)
+
+
+def _build_tts(tts_provider: str | None = None, voice_id: str | None = None):
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
 
     # return smallestai.TTS(
@@ -170,15 +217,13 @@ def _build_tts():
     #     language="en-IN"
     # )
 
-    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
-    language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
-    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+    provider = (tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
+    if provider != "sarvam":
+        logger.warning("Unsupported TTS provider requested: %s. Falling back to Sarvam.", tts_provider)
 
-    try:
-        pace = float(pace_raw)
-    except ValueError:
-        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
-        pace = 0.95
+    speaker = (voice_id or DEFAULT_TTS_VOICE_ID).strip().lower() or DEFAULT_TTS_VOICE_ID
+    language_code = DEFAULT_TTS_LANGUAGE
+    pace = _coerce_tts_pace(DEFAULT_TTS_PACE)
 
     model = get_bulbul_model(speaker)
     logger.info(
@@ -701,6 +746,10 @@ async def entrypoint(ctx: agents.JobContext):
     jd_text = "Not provided."
     prompt_text = ""
     total_minutes = 10
+    stt_model = DEFAULT_STT_PROVIDER
+    tts_provider = DEFAULT_TTS_PROVIDER
+    tts_voice_id = DEFAULT_TTS_VOICE_ID
+    llm_model = DEFAULT_LLM_MODEL
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
@@ -711,6 +760,10 @@ async def entrypoint(ctx: agents.JobContext):
             resume_text = data.get("resume", "Not provided.")
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
+            stt_model = data.get("sttModel") or stt_model
+            tts_provider = data.get("ttsProvider") or tts_provider
+            tts_voice_id = data.get("ttsVoiceId") or data.get("speaker") or tts_voice_id
+            llm_model = data.get("llmModel") or llm_model
 
             normalized_prompt = str(raw_prompt or "").strip()
             if normalized_prompt:
@@ -730,13 +783,9 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         # Use Silero VAD (required for non-streaming STT)
         vad=silero.VAD.load(),
-        # Use OpenAI gpt-4o-mini-transcribe for STT
-        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        # Use OpenAI GPT-5.4-mini for LLM
-        # llm=openai.LLM(model="gpt-5.4-nano"),
-        llm=anthropic.LLM(model="claude-haiku-4-5"),
-        # Use Sarvam bulbul:v3 ratan for TTS
-        tts=_build_tts(),
+        stt=_build_stt(stt_model),
+        llm=_build_llm(llm_model),
+        tts=_build_tts(tts_provider, tts_voice_id),
         userdata=fnc_ctx,
     )
 
