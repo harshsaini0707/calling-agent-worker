@@ -170,15 +170,15 @@ def _build_tts():
     #     language="en-IN"
     # )
 
-    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+    speaker = os.getenv("SARVAM_TTS_SPEAKER", "shreya").strip() or "shreya"
     language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
-    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+    pace_raw = os.getenv("SARVAM_TTS_PACE", "1.0").strip() or "1.0"
 
     try:
         pace = float(pace_raw)
     except ValueError:
-        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
-        pace = 0.95
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 1.0.", pace_raw)
+        pace = 1.0
 
     model = get_bulbul_model(speaker)
     logger.info(
