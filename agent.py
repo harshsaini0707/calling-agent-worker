@@ -194,6 +194,7 @@ def _build_tts():
         speaker=speaker,
         pace=pace,
         output_audio_codec="mp3",
+        speech_sample_rate=80000,
     )
 
 
