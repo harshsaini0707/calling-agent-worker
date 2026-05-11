@@ -239,6 +239,7 @@ def _build_tts(tts_provider: str | None = None, voice_id: str | None = None):
         speaker=speaker,
         pace=pace,
         output_audio_codec="mp3",
+        speech_sample_rate=80000,
     )
 
 
