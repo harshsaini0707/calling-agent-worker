@@ -77,10 +77,17 @@ Important metadata fields expected from the backend include:
 - `jd`
 - `total_minutes`
 - `templateQuestions`
+- `aiConfigVersion` (`2` for the structured config contract)
+- `aiConfig` with `stt`, `llm`, and `tts` sections:
+  - `stt.provider`, `stt.model`, `stt.language`, `stt.options`
+  - `llm.provider`, `llm.model`, `llm.temperature`, `llm.options`
+  - `tts.provider`, `tts.model`, `tts.voice`, `tts.language`, `tts.pace`, `tts.options`
 - `sttModel` (`openai` default, `deepgram` supported when `DEEPGRAM_API_KEY` is set)
 - `ttsProvider` (`sarvam` default; unsupported providers fall back to Sarvam)
 - `ttsVoiceId` (Sarvam speaker id, defaults to `simran`)
 - `llmModel` (`claude-haiku-4-5` default; `gpt-*` routes to OpenAI)
+
+The old four model fields are still accepted as fallback metadata. New dispatches should prefer `aiConfig`.
 
 ## Expected Contract With The Backend
 

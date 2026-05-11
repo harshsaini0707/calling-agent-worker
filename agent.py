@@ -12,15 +12,32 @@ from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_contex
 from livekit.plugins import (
     openai,
     deepgram,
-    # smallestai,
-    # cartesia,
     sarvam,
     anthropic,
-    # noise_cancellation,  
     silero,
 )
 from livekit.agents import llm
 from typing import Annotated, Optional
+
+try:
+    from livekit.agents import inference
+except ImportError:
+    inference = None
+
+try:
+    from livekit.plugins import assemblyai
+except ImportError:
+    assemblyai = None
+
+try:
+    from livekit.plugins import cartesia
+except ImportError:
+    cartesia = None
+
+try:
+    from livekit.plugins import elevenlabs
+except ImportError:
+    elevenlabs = None
 
 # Load environment variables
 load_dotenv(".env")
@@ -44,6 +61,29 @@ DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "sarvam").strip() or "s
 DEFAULT_TTS_VOICE_ID = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
 DEFAULT_TTS_LANGUAGE = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
 DEFAULT_TTS_PACE = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+DEFAULT_AI_CONFIG = {
+    "version": 2,
+    "stt": {
+        "provider": DEFAULT_STT_PROVIDER,
+        "model": DEFAULT_OPENAI_STT_MODEL if DEFAULT_STT_PROVIDER == "openai" else DEFAULT_DEEPGRAM_STT_MODEL,
+        "language": "en-IN" if DEFAULT_STT_PROVIDER == "deepgram" else "en",
+        "options": {},
+    },
+    "llm": {
+        "provider": "openai" if DEFAULT_LLM_MODEL.startswith("gpt-") else "anthropic",
+        "model": DEFAULT_LLM_MODEL,
+        "temperature": 0.4,
+        "options": {},
+    },
+    "tts": {
+        "provider": DEFAULT_TTS_PROVIDER,
+        "model": "bulbul",
+        "voice": DEFAULT_TTS_VOICE_ID,
+        "language": DEFAULT_TTS_LANGUAGE,
+        "pace": 0.95,
+        "options": {},
+    },
+}
 
 REQUIRED_RUNTIME_ENV_KEYS = [
     "LIVEKIT_URL",
@@ -179,51 +219,175 @@ def _coerce_tts_pace(value: str) -> float:
         return 0.95
 
 
-def _build_stt(stt_model: str | None):
-    normalized = (stt_model or DEFAULT_STT_PROVIDER).strip().lower()
-    if normalized == "deepgram":
-        if os.getenv("DEEPGRAM_API_KEY"):
-            logger.info("Using Deepgram STT: model=%s language=en-IN", DEFAULT_DEEPGRAM_STT_MODEL)
-            return deepgram.STT(model=DEFAULT_DEEPGRAM_STT_MODEL, language="en-IN")
-        logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
-    elif normalized != "openai":
-        logger.warning("Unsupported STT provider requested: %s. Falling back to OpenAI.", stt_model)
+DEFAULT_AI_CONFIG["tts"]["pace"] = _coerce_tts_pace(DEFAULT_TTS_PACE)
 
-    logger.info("Using OpenAI STT: model=%s language=en", DEFAULT_OPENAI_STT_MODEL)
+
+def _normalize_string(value, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    return normalized or fallback
+
+
+def _legacy_ai_config(metadata: dict | None = None) -> dict:
+    metadata = metadata or {}
+    stt_model = _normalize_string(metadata.get("sttModel"), DEFAULT_STT_PROVIDER).lower()
+    llm_model = _normalize_string(metadata.get("llmModel"), DEFAULT_LLM_MODEL)
+    tts_provider = _normalize_string(metadata.get("ttsProvider"), DEFAULT_TTS_PROVIDER).lower()
+    tts_voice = _normalize_string(metadata.get("ttsVoiceId") or metadata.get("speaker"), DEFAULT_TTS_VOICE_ID)
+
+    stt_provider = "deepgram" if stt_model == "deepgram" else "openai"
+    llm_provider = "openai" if llm_model.startswith("gpt-") else "anthropic"
+    if llm_model.startswith("gemini"):
+        llm_provider = "google"
+
+    tts_default_models = {
+        "sarvam": "bulbul",
+        "elevenlabs": "eleven_turbo_v2_5",
+        "cartesia": "sonic-3",
+        "deepgram": "aura-2",
+        "livekit-inference": "cartesia/sonic-3",
+    }
+
+    return {
+        "version": 2,
+        "stt": {
+            **DEFAULT_AI_CONFIG["stt"],
+            "provider": stt_provider,
+            "model": DEFAULT_DEEPGRAM_STT_MODEL if stt_provider == "deepgram" else DEFAULT_OPENAI_STT_MODEL,
+            "language": "en-IN" if stt_provider == "deepgram" else "en",
+        },
+        "llm": {
+            **DEFAULT_AI_CONFIG["llm"],
+            "provider": llm_provider,
+            "model": llm_model,
+        },
+        "tts": {
+            **DEFAULT_AI_CONFIG["tts"],
+            "provider": tts_provider,
+            "model": tts_default_models.get(tts_provider, "bulbul"),
+            "voice": tts_voice,
+        },
+    }
+
+
+def _normalize_ai_config(metadata: dict | None = None) -> dict:
+    metadata = metadata or {}
+    source = metadata.get("aiConfig")
+    if not isinstance(source, dict):
+        return _legacy_ai_config(metadata)
+
+    return {
+        "version": 2,
+        "stt": {**DEFAULT_AI_CONFIG["stt"], **(source.get("stt") or {})},
+        "llm": {**DEFAULT_AI_CONFIG["llm"], **(source.get("llm") or {})},
+        "tts": {**DEFAULT_AI_CONFIG["tts"], **(source.get("tts") or {})},
+    }
+
+
+def _inference_available(kind: str) -> bool:
+    if inference is not None:
+        return True
+    logger.warning("LiveKit Inference %s requested but this livekit-agents version has no inference module.", kind)
+    return False
+
+
+def _build_stt(ai_config: dict):
+    config = ai_config.get("stt", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_AI_CONFIG["stt"]["provider"]).lower()
+    model = _normalize_string(config.get("model"), DEFAULT_AI_CONFIG["stt"]["model"])
+    language = _normalize_string(config.get("language"), DEFAULT_AI_CONFIG["stt"]["language"])
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
+
+    if provider == "livekit-inference" and _inference_available("STT"):
+        logger.info("Using LiveKit Inference STT: model=%s language=%s", model, language)
+        return inference.STT(model=model, language=language, extra_kwargs=options)
+
+    if provider == "deepgram":
+        if os.getenv("DEEPGRAM_API_KEY"):
+            logger.info("Using Deepgram STT: model=%s language=%s", model, language)
+            return deepgram.STT(model=model, language=language)
+        logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
+
+    if provider == "assemblyai" and assemblyai is not None:
+        logger.info("Using AssemblyAI STT: model=%s language=%s", model, language)
+        return assemblyai.STT(model=model, language=language)
+
+    if provider == "sarvam" and hasattr(sarvam, "STT"):
+        logger.info("Using Sarvam STT: model=%s language=%s", model, language)
+        return sarvam.STT(model=model, language=language)
+
+    if provider not in ("openai", "deepgram"):
+        logger.warning("Unsupported or unavailable STT provider requested: %s. Falling back to OpenAI.", provider)
+
+    logger.info("Using OpenAI STT: model=%s language=%s", DEFAULT_OPENAI_STT_MODEL, "en")
     return openai.STT(model=DEFAULT_OPENAI_STT_MODEL, language="en")
 
 
-def _build_llm(llm_model: str | None):
-    model = (llm_model or DEFAULT_LLM_MODEL).strip() or DEFAULT_LLM_MODEL
-    normalized = model.lower()
+def _build_llm(ai_config: dict):
+    config = ai_config.get("llm", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_AI_CONFIG["llm"]["provider"]).lower()
+    model = _normalize_string(config.get("model"), DEFAULT_LLM_MODEL)
+    temperature = config.get("temperature", DEFAULT_AI_CONFIG["llm"]["temperature"])
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
 
-    if normalized.startswith("gpt-"):
+    if provider == "livekit-inference" and _inference_available("LLM"):
+        extra_kwargs = {"temperature": temperature, **options}
+        logger.info("Using LiveKit Inference LLM: model=%s", model)
+        return inference.LLM(model=model, extra_kwargs=extra_kwargs)
+
+    if provider == "openai":
         logger.info("Using OpenAI LLM: model=%s", model)
-        return openai.LLM(model=model)
+        responses_api = getattr(openai, "responses", None)
+        if responses_api and hasattr(responses_api, "LLM"):
+            return responses_api.LLM(model=model, temperature=temperature)
+        return openai.LLM(model=model, temperature=temperature)
 
-    if normalized.startswith("gemini"):
-        logger.warning("Gemini LLM requested but this worker has no Google plugin configured; falling back to %s.", DEFAULT_LLM_MODEL)
-        model = DEFAULT_LLM_MODEL
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if api_key:
+            logger.info("Using OpenRouter LLM: model=%s", model)
+            return openai.LLM(model=model, base_url="https://openrouter.ai/api/v1", api_key=api_key, temperature=temperature)
+        logger.warning("OpenRouter LLM requested but OPENROUTER_API_KEY is not configured; falling back to Anthropic")
 
-    logger.info("Using Anthropic LLM: model=%s", model)
-    return anthropic.LLM(model=model)
+    if provider == "google":
+        logger.warning("Google Gemini LLM requested but this worker does not load the Gemini plugin yet; falling back to Anthropic")
+
+    if provider not in ("anthropic", "openrouter", "google"):
+        logger.warning("Unsupported LLM provider requested: %s. Falling back to Anthropic.", provider)
+
+    logger.info("Using Anthropic LLM: model=%s", DEFAULT_LLM_MODEL)
+    return anthropic.LLM(model=DEFAULT_LLM_MODEL, temperature=min(float(temperature), 1.0))
 
 
-def _build_tts(tts_provider: str | None = None, voice_id: str | None = None):
+def _build_tts(ai_config: dict):
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
+    config = ai_config.get("tts", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_TTS_PROVIDER).lower()
+    model = _normalize_string(config.get("model"), "bulbul")
+    voice = _normalize_string(config.get("voice") or config.get("voiceId"), DEFAULT_TTS_VOICE_ID)
+    language_code = _normalize_string(config.get("language"), DEFAULT_TTS_LANGUAGE)
+    pace = _coerce_tts_pace(str(config.get("pace", DEFAULT_TTS_PACE)))
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
 
-    # return smallestai.TTS(
-    #     voice_id="yuvika",
-    #     language="en-IN"
-    # )
+    if provider == "livekit-inference" and _inference_available("TTS"):
+        logger.info("Using LiveKit Inference TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return inference.TTS(model=model, voice=voice, language=language_code, extra_kwargs=options)
 
-    provider = (tts_provider or DEFAULT_TTS_PROVIDER).strip().lower()
+    if provider == "elevenlabs" and elevenlabs is not None:
+        logger.info("Using ElevenLabs TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return elevenlabs.TTS(model=model, voice_id=voice, language=language_code)
+
+    if provider == "cartesia" and cartesia is not None:
+        logger.info("Using Cartesia TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return cartesia.TTS(model=model, voice=voice, language=language_code)
+
+    if provider == "deepgram":
+        logger.info("Using Deepgram TTS: model=%s voice=%s", model, voice)
+        return deepgram.TTS(model=f"{model}-{voice}" if voice and voice not in model else model)
+
     if provider != "sarvam":
-        logger.warning("Unsupported TTS provider requested: %s. Falling back to Sarvam.", tts_provider)
+        logger.warning("Unsupported or unavailable TTS provider requested: %s. Falling back to Sarvam.", provider)
 
-    speaker = (voice_id or DEFAULT_TTS_VOICE_ID).strip().lower() or DEFAULT_TTS_VOICE_ID
-    language_code = DEFAULT_TTS_LANGUAGE
-    pace = _coerce_tts_pace(DEFAULT_TTS_PACE)
+    speaker = voice.strip().lower() or DEFAULT_TTS_VOICE_ID
 
     model = get_bulbul_model(speaker)
     logger.info(
@@ -747,10 +911,7 @@ async def entrypoint(ctx: agents.JobContext):
     jd_text = "Not provided."
     prompt_text = ""
     total_minutes = 10
-    stt_model = DEFAULT_STT_PROVIDER
-    tts_provider = DEFAULT_TTS_PROVIDER
-    tts_voice_id = DEFAULT_TTS_VOICE_ID
-    llm_model = DEFAULT_LLM_MODEL
+    ai_config = DEFAULT_AI_CONFIG
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
@@ -761,10 +922,7 @@ async def entrypoint(ctx: agents.JobContext):
             resume_text = data.get("resume", "Not provided.")
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
-            stt_model = data.get("sttModel") or stt_model
-            tts_provider = data.get("ttsProvider") or tts_provider
-            tts_voice_id = data.get("ttsVoiceId") or data.get("speaker") or tts_voice_id
-            llm_model = data.get("llmModel") or llm_model
+            ai_config = _normalize_ai_config(data)
 
             normalized_prompt = str(raw_prompt or "").strip()
             if normalized_prompt:
@@ -784,9 +942,9 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         # Use Silero VAD (required for non-streaming STT)
         vad=silero.VAD.load(),
-        stt=_build_stt(stt_model),
-        llm=_build_llm(llm_model),
-        tts=_build_tts(tts_provider, tts_voice_id),
+        stt=_build_stt(ai_config),
+        llm=_build_llm(ai_config),
+        tts=_build_tts(ai_config),
         userdata=fnc_ctx,
     )
 
