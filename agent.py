@@ -58,13 +58,6 @@ def validate_runtime_env():
         )
         return False
 
-    if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
-        logger.error(
-            "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
-            BACKEND_WEBHOOK_URL,
-        )
-        return False
-
     return True
 
 def _get_messages(session):
@@ -108,12 +101,67 @@ def _collect_transcript(session) -> list:
     return transcript
 
 
+VOICEMAIL_PHRASES = [
+    "please leave a message",
+    "leave a message after the beep",
+    "leave a message after the tone",
+    "the person you are trying to reach",
+    "is not available",
+    "is currently unavailable",
+    "mailbox is full",
+    "you have reached the voicemail",
+    "please record your message",
+]
+
+MIN_CANDIDATE_WORDS_FOR_EVAL = 15
+
+
+def _classify_outcome(transcript: list, connected: bool) -> tuple[str, int, int]:
+    """
+    Analyze transcript and return (outcome, user_turns, candidate_word_count).
+    
+    Rules:
+    - If not connected at all -> NO_ANSWER (caller decides)
+    - If only agent spoke (user_turns == 0) -> NO_ANSWER (rang but nobody spoke)
+    - If candidate spoke < MIN_CANDIDATE_WORDS -> PREMATURE_DISCONNECT
+    - If first user turn looks like voicemail -> VOICEMAIL  
+    - Otherwise -> COMPLETED (real conversation happened)
+    """
+    if not connected or not transcript:
+        return "NO_ANSWER", 0, 0
+
+    user_turns = [t for t in transcript if t.get("role") == "user"]
+    candidate_word_count = sum(len(t.get("text", "").split()) for t in user_turns)
+    user_turn_count = len(user_turns)
+
+    # No candidate speech at all
+    if user_turn_count == 0:
+        return "NO_ANSWER", 0, 0
+
+    # Check if first user turn is a voicemail greeting
+    first_user_text = user_turns[0].get("text", "").lower()
+    for phrase in VOICEMAIL_PHRASES:
+        if phrase in first_user_text:
+            logger.info(f"Voicemail detected in first user turn: '{phrase}'")
+            return "VOICEMAIL", user_turn_count, candidate_word_count
+
+    # Not enough real conversation
+    if candidate_word_count < MIN_CANDIDATE_WORDS_FOR_EVAL:
+        logger.info(f"Premature disconnect — candidate only said {candidate_word_count} words across {user_turn_count} turns")
+        return "PREMATURE_DISCONNECT", user_turn_count, candidate_word_count
+
+    return "COMPLETED", user_turn_count, candidate_word_count
+
+
 async def report_outcome(
     schedule_id: str,
     outcome: str,
     duration: int = None,
     call_uuid: str = None,
     transcript: list = None,
+    error_message: str = None,
+    candidate_word_count: int = None,
+    transcript_turn_count: int = None,
 ):
     if not schedule_id:
         return
@@ -127,6 +175,12 @@ async def report_outcome(
                 payload["callUuid"] = call_uuid
             if transcript:
                 payload["transcript"] = transcript
+            if error_message:
+                payload["errorMessage"] = error_message
+            if candidate_word_count is not None:
+                payload["candidateWordCount"] = candidate_word_count
+            if transcript_turn_count is not None:
+                payload["transcriptTurnCount"] = transcript_turn_count
 
             # Serialize payload to match EXACT bytes sent over the wire
             payload_bytes = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
@@ -145,8 +199,8 @@ async def report_outcome(
                     hashlib.sha256
                 ).hexdigest()
                 headers["X-Call-Screening-Signature"] = f"sha256={signature}"
-            else:
-                logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
+            # else:
+            #     logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
 
             async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers) as resp:
                 response_body = await resp.text()
@@ -185,7 +239,6 @@ def _build_tts():
         model=model,
         speaker=speaker,
         pace=pace,
-        output_audio_codec="mp3",
     )
 
 
@@ -749,7 +802,8 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
 
-    # Track whether we already reported the outcome (to avoid duplicate webhooks)
+    # Track call connected state so classifier knows if call was answered
+    call_connected = False
     outcome_reported = False
     sip_call_uuid = None  # Vobiz call_uuid captured from SIP participant attributes
 
@@ -786,21 +840,27 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             logger.warning(f"Could not capture call_uuid: {e}")
 
-    async def _safe_report(outcome: str, dur: int = None):
-        """Report outcome exactly once — includes transcript and call_uuid."""
+    async def _safe_report(forced_outcome: str = None, dur: int = None):
+        """Classify transcript quality, then report outcome exactly once."""
         nonlocal outcome_reported
         if outcome_reported or not schedule_id:
             return
         outcome_reported = True
         try:
             transcript = _collect_transcript(session)
-            logger.info(f"Collected transcript with {len(transcript)} turns")
+            classified_outcome, user_turns, word_count = _classify_outcome(transcript, call_connected)
+            # If caller forces a specific outcome (e.g. NO_ANSWER, CALL_REJECTED) respect it
+            # Otherwise use the classified outcome from transcript analysis
+            final_outcome = forced_outcome if forced_outcome else classified_outcome
+            logger.info(f"Collected transcript: {len(transcript)} turns, candidate turns: {user_turns}, words: {word_count} → outcome: {final_outcome}")
             await report_outcome(
                 schedule_id,
-                outcome,
+                final_outcome,
                 duration=dur,
                 call_uuid=sip_call_uuid,
                 transcript=transcript,
+                candidate_word_count=word_count,
+                transcript_turn_count=len(transcript),
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
@@ -825,7 +885,8 @@ async def entrypoint(ctx: agents.JobContext):
         if schedule_id and not outcome_reported:
             try:
                 duration = int(time.time() - agent._call_start_time)
-                asyncio.create_task(_safe_report("COMPLETED", duration))
+                # Let _safe_report classify the transcript — no forced outcome
+                asyncio.create_task(_safe_report(dur=duration))
             except Exception as e:
                 logger.error(f"Error sending disconnect webhook: {e}")
 
@@ -838,7 +899,8 @@ async def entrypoint(ctx: agents.JobContext):
                 duration = int(time.time() - agent._call_start_time)
             except Exception:
                 duration = 0
-            asyncio.create_task(_safe_report("COMPLETED", duration))
+            # Let _safe_report classify — no forced outcome
+            asyncio.create_task(_safe_report(dur=duration))
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
@@ -908,6 +970,7 @@ async def entrypoint(ctx: agents.JobContext):
                 )
             )
             logger.info("Call answered! Agent is now listening.")
+            call_connected = True
             
             # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
@@ -924,10 +987,17 @@ async def entrypoint(ctx: agents.JobContext):
                 )
             
         except Exception as e:
+            err_str = str(e).lower()
             logger.error(f"Failed to place outbound call: {e}")
             if schedule_id:
-                await report_outcome(schedule_id, "NO_ANSWER")
-            # Ensure we clean up if the call fails
+                # Classify SIP-level failure
+                if "603" in err_str or "decline" in err_str or "rejected" in err_str:
+                    outcome = "CALL_REJECTED"
+                elif "invalid" in err_str or "404" in err_str or "480" in err_str or "not found" in err_str:
+                    outcome = "INVALID_NUMBER"
+                else:
+                    outcome = "NO_ANSWER"
+                await report_outcome(schedule_id, outcome, error_message=str(e))
             ctx.shutdown()
     else:
         # Fallback for inbound calls (if this agent is used for that)
