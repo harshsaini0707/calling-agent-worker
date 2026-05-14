@@ -11,8 +11,10 @@ from livekit import agents, api, rtc
 from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
 from livekit.plugins import (
     openai,
-    cartesia,
+    # smallestai,
+    # cartesia,
     sarvam,
+    anthropic,
     # noise_cancellation,  
     silero,
 )
@@ -216,15 +218,21 @@ def get_bulbul_model(speaker: str) -> str:
 
 def _build_tts():
     """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
-    speaker = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+
+    # return smallestai.TTS(
+    #     voice_id="yuvika",
+    #     language="en-IN"
+    # )
+
+    speaker = os.getenv("SARVAM_TTS_SPEAKER", "shreya").strip() or "shreya"
     language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
-    pace_raw = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+    pace_raw = os.getenv("SARVAM_TTS_PACE", "1.0").strip() or "1.0"
 
     try:
         pace = float(pace_raw)
     except ValueError:
-        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", pace_raw)
-        pace = 0.95
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 1.0.", pace_raw)
+        pace = 1.0
 
     model = get_bulbul_model(speaker)
     logger.info(
@@ -239,6 +247,8 @@ def _build_tts():
         model=model,
         speaker=speaker,
         pace=pace,
+        output_audio_codec="mp3",
+        speech_sample_rate=8000,
     )
 
 
@@ -777,8 +787,9 @@ async def entrypoint(ctx: agents.JobContext):
         vad=silero.VAD.load(),
         # Use OpenAI gpt-4o-mini-transcribe for STT
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        # Use OpenAI GPT-5-nano for LLM
-        llm=openai.LLM(model="gpt-5-nano"),
+        # Use OpenAI GPT-5.4-mini for LLM
+        # llm=openai.LLM(model="gpt-5.4-nano"),
+        llm=anthropic.LLM(model="claude-haiku-4-5"),
         # Use Sarvam bulbul:v3 ratan for TTS
         tts=_build_tts(),
         userdata=fnc_ctx,
