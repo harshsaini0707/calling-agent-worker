@@ -785,8 +785,8 @@ async def entrypoint(ctx: agents.JobContext):
     session = AgentSession(
         # Use Silero VAD (required for non-streaming STT)
         vad=silero.VAD.load(),
-        # Use OpenAI gpt-4o-mini-transcribe for STT
-        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
+        # Use OpenAI Whisper for STT
+        stt=openai.STT(model="gpt-realtime-whisper", language="en"),
         # Use OpenAI GPT-5.4-mini for LLM
         # llm=openai.LLM(model="gpt-5.4-nano"),
         llm=anthropic.LLM(model="claude-haiku-4-5"),
