@@ -8,7 +8,7 @@ import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
+from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext, TurnHandlingOptions
 from livekit.plugins import (
     openai,
     # smallestai,
@@ -247,7 +247,7 @@ def _build_tts():
         model=model,
         speaker=speaker,
         pace=pace,
-        output_audio_codec="mp3",
+        output_audio_codec="wav",
         speech_sample_rate=8000,
     )
 
@@ -783,16 +783,14 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize the Agent Session with plugins
 
     session = AgentSession(
-        # Use Silero VAD (required for non-streaming STT)
         vad=silero.VAD.load(),
-        # Use OpenAI Whisper for STT
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        # Use OpenAI GPT-5.4-mini for LLM
-        # llm=openai.LLM(model="gpt-5.4-nano"),
         llm=anthropic.LLM(model="claude-haiku-4-5"),
-        # Use Sarvam bulbul:v3 ratan for TTS
         tts=_build_tts(),
         userdata=fnc_ctx,
+        turn_handling=TurnHandlingOptions(
+            interruption={"mode": "adaptive"},
+        ),
     )
 
     # Start the session
