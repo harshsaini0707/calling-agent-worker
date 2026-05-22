@@ -783,7 +783,12 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize the Agent Session with plugins
 
     session = AgentSession(
-        vad=silero.VAD.load(),
+        vad=silero.VAD.load(
+            min_speech_duration=0.2,
+            min_silence_duration=0.5,
+            padding_duration=0.1,
+            sample_rate=8000,
+        ),
         stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
         llm=anthropic.LLM(model="claude-haiku-4-5"),
         tts=_build_tts(),
