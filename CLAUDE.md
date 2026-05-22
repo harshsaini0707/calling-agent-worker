@@ -45,9 +45,9 @@ This repo does own:
 - Runtime: Python 3.12
 - Agent framework: LiveKit Agents SDK
 - VAD: Silero
-- STT: OpenAI plugin
-- LLM: OpenAI plugin
-- TTS: OpenAI TTS
+- STT: OpenAI `gpt-4o-mini-transcribe`
+- LLM: Anthropic `claude-haiku-4-5`
+- TTS: Sarvam Bulbul (`en-IN`, configurable via `SARVAM_TTS_SPEAKER` / `SARVAM_TTS_PACE`)
 
 If the code switches providers, update this file and the README immediately.
 
