@@ -135,6 +135,12 @@ def validate_runtime_env():
         )
         return False
 
+    if BACKEND_WEBHOOK_URL.startswith("http://") and not BACKEND_WEBHOOK_URL.startswith("http://host.docker.internal"):
+        logger.warning(
+            "BACKEND_WEBHOOK_URL=%s uses plain HTTP. If the server redirects to HTTPS, the POST will become a GET and return 405. Use https:// instead.",
+            BACKEND_WEBHOOK_URL,
+        )
+
     return True
 
 def _get_messages(session):
@@ -218,9 +224,13 @@ async def report_outcome(
             else:
                 logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
 
-            async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers) as resp:
+            async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers, allow_redirects=False) as resp:
                 response_body = await resp.text()
-                logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
+                if resp.status in (301, 302, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    logger.error(f"Webhook URL redirected ({resp.status}) to {location} — update BACKEND_WEBHOOK_URL to avoid redirect")
+                else:
+                    logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
     except Exception as e:
         logger.error(f"Webhook failed: {e}")
 
