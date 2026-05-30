@@ -432,8 +432,9 @@ def _build_tts(ai_config: dict):
         model=model,
         speaker=speaker,
         pace=pace,
-        output_audio_codec="mp3",
+        output_audio_codec="mulaw",
         speech_sample_rate=8000,
+        min_buffer_size=30,
     )
 
 
@@ -1195,9 +1196,9 @@ async def entrypoint(ctx: agents.JobContext):
 
             # Pre-generate the greeting while the phone is ringing so TTS audio
             # is buffered and plays immediately when the call is answered.
-            pregen_task = asyncio.create_task(
-                session.generate_reply(instructions=greeting_instructions)
-            )
+            # generate_reply() returns a SpeechHandle and schedules generation
+            # internally — no await/create_task needed.
+            session.generate_reply(instructions=greeting_instructions)
 
             # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(
@@ -1213,10 +1214,6 @@ async def entrypoint(ctx: agents.JobContext):
 
             # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
-
-            # Ensure greeting finishes playing (usually already done by ring time)
-            if not pregen_task.done():
-                await pregen_task
             
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")
