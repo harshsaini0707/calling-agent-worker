@@ -6,7 +6,8 @@ services:
     env_file:
       - .env
     working_dir: /app
-    command: ["python", "agent.py", "start"]
-    volumes:
-      - .:/app
+    # Production image bakes deps into a uv-managed venv and runs as non-root.
+    # No bind mount here (it would shadow the baked /app + venv); use
+    # docker-compose.local.yml for live code-sync dev.
+    command: ["uv", "run", "--no-sync", "agent.py", "start"]
     restart: unless-stopped

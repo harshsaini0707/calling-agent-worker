@@ -8,7 +8,19 @@ import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    EndpointingOptions,
+    InterruptionOptions,
+    JobProcess,
+    RoomInputOptions,
+    RunContext,
+    TurnHandlingOptions,
+    function_tool,
+    get_job_context,
+)
 from livekit.plugins import (
     openai,
     deepgram,
@@ -23,6 +35,13 @@ try:
     from livekit.agents import inference
 except ImportError:
     inference = None
+
+# Telephony-grade noise cancellation. Kept optional so local dev without the
+# plugin installed still imports; BVCTelephony is enabled when present (see entrypoint).
+try:
+    from livekit.plugins import noise_cancellation
+except ImportError:
+    noise_cancellation = None
 
 try:
     from livekit.plugins import assemblyai
@@ -885,6 +904,24 @@ async def hangup_call():
     )
 
 
+# ── LiveKit prewarm ───────────────────────────────────────────────────────────
+def prewarm(proc: JobProcess) -> None:
+    """Load the Silero VAD once per worker process and reuse across jobs.
+
+    On LiveKit Cloud the worker is long-lived and handles many calls, so loading
+    the VAD here (instead of per-session) cuts per-call cold-start latency.
+    """
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+# ── Agent server ──────────────────────────────────────────────────────────────
+# agent_name MUST stay "outbound-caller": the backend/make_call dispatch targets
+# this name to place outbound SIP calls. Do not rename.
+server = AgentServer()
+server.setup_fnc = prewarm
+
+
+@server.rtc_session(agent_name="outbound-caller")
 async def entrypoint(ctx: agents.JobContext):
     """
     Main entrypoint for the agent.
@@ -940,12 +977,25 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize the Agent Session with plugins
 
     session = AgentSession(
-        # Use Silero VAD (required for non-streaming STT)
-        vad=silero.VAD.load(),
+        # Silero VAD (required for non-streaming STT), prewarmed once per process.
+        vad=ctx.proc.userdata["vad"],
         stt=_build_stt(ai_config),
         llm=_build_llm(ai_config),
         tts=_build_tts(ai_config),
         userdata=fnc_ctx,
+        turn_handling=TurnHandlingOptions(
+            # min_delay 1.0s (up from the 0.5s default) so a thinking-pause mid-answer
+            # isn't treated as end-of-turn — the agent was cutting candidates off.
+            # max_delay 3.0s is the hard cap before the turn is forced closed.
+            # Telephony note: phone audio is noisier/laggier than web; 1.0s is a sane
+            # starting point. Tune up if cut-offs persist on real calls.
+            endpointing=EndpointingOptions(min_delay=1.0, max_delay=3.0),
+            # adaptive interruption distinguishes real interruptions from backchannel
+            # ("mm-hm", "okay"); min_duration 0.5s ignores brief blips/line noise.
+            interruption=InterruptionOptions(mode="adaptive", min_duration=0.5),
+            # Keep preemptive generation for snappy replies.
+            preemptive_generation={"enabled": True, "preemptive_tts": True},
+        ),
     )
 
     # Start the session
@@ -957,11 +1007,19 @@ async def entrypoint(ctx: agents.JobContext):
         prompt_text=prompt_text,
         total_minutes=total_minutes,
     )
+    # BVCTelephony is the phone-tuned noise-cancellation model (narrowband SIP audio).
+    # Do NOT use ai_coustics QUAIL here — that targets wideband web audio.
+    nc = noise_cancellation.BVCTelephony() if noise_cancellation is not None else None
+    if nc is None:
+        logger.warning(
+            "noise_cancellation plugin unavailable; running without BVCTelephony"
+        )
+
     await session.start(
         room=ctx.room,
         agent=agent,
         room_input_options=RoomInputOptions(
-            # noise_cancellation=noise_cancellation.BVCTelephony(), 
+            noise_cancellation=nc,
             close_on_disconnect=True,
         ),
     )
@@ -1153,10 +1211,6 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    # The agent name "outbound-caller" is used by the dispatch script to find this worker
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller", 
-        )
-    )
+    # agent_name "outbound-caller" is set on the @server.rtc_session decorator above;
+    # the dispatch script / backend uses that name to find this worker.
+    agents.cli.run_app(server)
