@@ -1186,6 +1186,19 @@ async def entrypoint(ctx: agents.JobContext):
             ctx.shutdown()
             return
         try:
+            has_custom_prompt = prompt_text and prompt_text.strip() != ""
+            greeting_instructions = (
+                "The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
+                if has_custom_prompt
+                else "The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
+            )
+
+            # Pre-generate the greeting while the phone is ringing so TTS audio
+            # is buffered and plays immediately when the call is answered.
+            pregen_task = asyncio.create_task(
+                session.generate_reply(instructions=greeting_instructions)
+            )
+
             # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
@@ -1197,20 +1210,13 @@ async def entrypoint(ctx: agents.JobContext):
                 )
             )
             logger.info("Call answered! Agent is now listening.")
-            
+
             # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
-            
-            # Use appropriate greeting based on which prompt mode is active
-            has_custom_prompt = prompt_text and prompt_text.strip() != ""
-            if has_custom_prompt:
-                await session.generate_reply(
-                    instructions="The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
-                )
-            else:
-                await session.generate_reply(
-                    instructions="The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
-                )
+
+            # Ensure greeting finishes playing (usually already done by ring time)
+            if not pregen_task.done():
+                await pregen_task
             
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")
