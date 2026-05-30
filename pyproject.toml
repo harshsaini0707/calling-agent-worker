@@ -11,6 +11,9 @@ dependencies = [
     "livekit-plugins-sarvam>=1.5.9,<2.0.0",
     # Telephony-grade noise cancellation (BVCTelephony, narrowband SIP audio).
     "livekit-plugins-noise-cancellation",
+    # SmallestAI Pulse STT — streaming ASR with word-level timestamps
+    # (enables adaptive interruption). Pinned to match livekit-agents pin.
+    "livekit-plugins-smallestai==1.5.12",
     # Webhook reporting back to the backend.
     "aiohttp>=3.10.0,<4.0.0",
     "python-dotenv>=1.0.0,<2.0.0",

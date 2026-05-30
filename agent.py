@@ -49,6 +49,12 @@ except ImportError:
     assemblyai = None
 
 try:
+    from livekit.plugins import smallestai as _smallestai_plugin
+    SmallestSTT = _smallestai_plugin.STT
+except ImportError:
+    SmallestSTT = None
+
+try:
     from livekit.plugins import cartesia
 except ImportError:
     cartesia = None
@@ -337,6 +343,18 @@ def _build_stt(ai_config: dict):
             return deepgram.STT(model=model, language=language)
         logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
 
+    if provider == "smallest":
+        if SmallestSTT is not None and os.getenv("SMALLEST_API_KEY"):
+            logger.info("Using SmallestAI Pulse STT: language=%s", language)
+            return SmallestSTT(
+                language=language,
+                sample_rate=16000,
+                encoding="linear16",
+                word_timestamps=True,
+                eou_timeout_ms=0,  # let LiveKit turn detection handle EOU
+            )
+        logger.warning("SmallestAI Pulse STT requested but unavailable; falling back to OpenAI")
+
     if provider == "assemblyai" and assemblyai is not None:
         logger.info("Using AssemblyAI STT: model=%s language=%s", model, language)
         return assemblyai.STT(model=model, language=language)
@@ -345,7 +363,7 @@ def _build_stt(ai_config: dict):
         logger.info("Using Sarvam STT: model=%s language=%s", model, language)
         return sarvam.STT(model=model, language=language)
 
-    if provider not in ("openai", "deepgram"):
+    if provider not in ("openai", "deepgram", "smallest", "assemblyai", "sarvam"):
         logger.warning("Unsupported or unavailable STT provider requested: %s. Falling back to OpenAI.", provider)
 
     logger.info("Using OpenAI STT: model=%s language=%s", DEFAULT_OPENAI_STT_MODEL, "en")
