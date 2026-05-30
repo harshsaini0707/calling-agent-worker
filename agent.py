@@ -111,7 +111,6 @@ REQUIRED_RUNTIME_ENV_KEYS = [
     "OPENAI_API_KEY",
     "SARVAM_API_KEY",
     "OUTBOUND_TRUNK_ID",
-    "BACKEND_WEBHOOK_URL",
 ]
 
 
@@ -190,10 +189,12 @@ async def report_outcome(
     duration: int = None,
     call_uuid: str = None,
     transcript: list = None,
+    webhook_url: str = None,
 ):
     if not schedule_id:
         return
-    logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id}")
+    target_url = webhook_url or BACKEND_WEBHOOK_URL
+    logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id} → {target_url}")
     try:
         async with aiohttp.ClientSession() as http_session:
             payload = {"scheduleId": schedule_id, "outcome": outcome}
@@ -224,11 +225,11 @@ async def report_outcome(
             else:
                 logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
 
-            async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers, allow_redirects=False) as resp:
+            async with http_session.post(target_url, data=payload_bytes, headers=headers, allow_redirects=False) as resp:
                 response_body = await resp.text()
                 if resp.status in (301, 302, 307, 308):
                     location = resp.headers.get("Location", "")
-                    logger.error(f"Webhook URL redirected ({resp.status}) to {location} — update BACKEND_WEBHOOK_URL to avoid redirect")
+                    logger.error(f"Webhook URL redirected ({resp.status}) to {location} — update webhook_url in dispatch metadata or BACKEND_WEBHOOK_URL env to avoid redirect")
                 else:
                     logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
     except Exception as e:
@@ -959,6 +960,7 @@ async def entrypoint(ctx: agents.JobContext):
     prompt_text = ""
     total_minutes = 10
     ai_config = DEFAULT_AI_CONFIG
+    call_webhook_url = None
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
@@ -970,6 +972,7 @@ async def entrypoint(ctx: agents.JobContext):
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
             ai_config = _normalize_ai_config(data)
+            call_webhook_url = data.get("webhook_url") or None
 
             normalized_prompt = str(raw_prompt or "").strip()
             if normalized_prompt:
@@ -1086,6 +1089,7 @@ async def entrypoint(ctx: agents.JobContext):
                 duration=dur,
                 call_uuid=sip_call_uuid,
                 transcript=transcript,
+                webhook_url=call_webhook_url,
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
@@ -1178,7 +1182,7 @@ async def entrypoint(ctx: agents.JobContext):
         if not OUTBOUND_TRUNK_ID:
             logger.error("OUTBOUND_TRUNK_ID is missing. Cannot place outbound SIP call.")
             if schedule_id:
-                await report_outcome(schedule_id, "FAILED")
+                await report_outcome(schedule_id, "FAILED", webhook_url=call_webhook_url)
             ctx.shutdown()
             return
         try:
@@ -1211,7 +1215,7 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             logger.error(f"Failed to place outbound call: {e}")
             if schedule_id:
-                await report_outcome(schedule_id, "NO_ANSWER")
+                await report_outcome(schedule_id, "NO_ANSWER", webhook_url=call_webhook_url)
             # Ensure we clean up if the call fails
             ctx.shutdown()
     else:
