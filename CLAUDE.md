@@ -104,10 +104,19 @@ Webhook payload sent back by this repo:
 ```json
 {
   "scheduleId": "uuid",
-  "outcome": "COMPLETED" | "NO_ANSWER" | "FAILED" | "BUSY" | "VOICEMAIL",
-  "durationSec": 142
+  "outcome": "COMPLETED" | "NO_ANSWER" | "FAILED" | "VOICEMAIL" | "PREMATURE_DISCONNECT" | "CALL_REJECTED" | "INVALID_NUMBER",
+  "durationSec": 142,
+  "callUuid": "optional",
+  "transcript": [{"role": "agent|user", "text": "..."}],
+  "candidateWordCount": 42,
+  "transcriptTurnCount": 8,
+  "errorMessage": "optional SIP or runtime error detail"
 }
 ```
+
+Outcomes are classified from the transcript when the call disconnects, unless a
+specific outcome is forced (e.g. SIP failure before answer). Per-dispatch
+`webhook_url` in job metadata takes precedence over `BACKEND_WEBHOOK_URL`.
 
 ## Maintenance Rule
 

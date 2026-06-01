@@ -78,7 +78,7 @@ OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
-DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "openai").strip() or "openai"
+DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "smallest").strip() or "smallest"
 DEFAULT_OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
 DEFAULT_DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3").strip() or "nova-3"
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
@@ -189,6 +189,58 @@ def _collect_transcript(session) -> list:
     return transcript
 
 
+VOICEMAIL_PHRASES = [
+    "please leave a message",
+    "leave a message after the beep",
+    "leave a message after the tone",
+    "the person you are trying to reach",
+    "is not available",
+    "is currently unavailable",
+    "mailbox is full",
+    "you have reached the voicemail",
+    "please record your message",
+]
+
+MIN_CANDIDATE_WORDS_FOR_EVAL = 15
+
+
+def _classify_outcome(transcript: list, connected: bool) -> tuple[str, int, int]:
+    """
+    Analyze transcript and return (outcome, user_turns, candidate_word_count).
+
+    Rules:
+    - If not connected at all -> NO_ANSWER
+    - If only agent spoke (user_turns == 0) -> NO_ANSWER
+    - If candidate spoke < MIN_CANDIDATE_WORDS -> PREMATURE_DISCONNECT
+    - If first user turn looks like voicemail -> VOICEMAIL
+    - Otherwise -> COMPLETED
+    """
+    if not connected or not transcript:
+        return "NO_ANSWER", 0, 0
+
+    user_turns = [t for t in transcript if t.get("role") == "user"]
+    candidate_word_count = sum(len(t.get("text", "").split()) for t in user_turns)
+    user_turn_count = len(user_turns)
+
+    if user_turn_count == 0:
+        return "NO_ANSWER", 0, 0
+
+    first_user_text = user_turns[0].get("text", "").lower()
+    for phrase in VOICEMAIL_PHRASES:
+        if phrase in first_user_text:
+            logger.info(f"Voicemail detected in first user turn: '{phrase}'")
+            return "VOICEMAIL", user_turn_count, candidate_word_count
+
+    if candidate_word_count < MIN_CANDIDATE_WORDS_FOR_EVAL:
+        logger.info(
+            f"Premature disconnect — candidate only said {candidate_word_count} words "
+            f"across {user_turn_count} turns"
+        )
+        return "PREMATURE_DISCONNECT", user_turn_count, candidate_word_count
+
+    return "COMPLETED", user_turn_count, candidate_word_count
+
+
 async def report_outcome(
     schedule_id: str,
     outcome: str,
@@ -196,6 +248,9 @@ async def report_outcome(
     call_uuid: str = None,
     transcript: list = None,
     webhook_url: str = None,
+    error_message: str = None,
+    candidate_word_count: int = None,
+    transcript_turn_count: int = None,
 ):
     if not schedule_id:
         return
@@ -210,6 +265,12 @@ async def report_outcome(
                 payload["callUuid"] = call_uuid
             if transcript:
                 payload["transcript"] = transcript
+            if error_message:
+                payload["errorMessage"] = error_message
+            if candidate_word_count is not None:
+                payload["candidateWordCount"] = candidate_word_count
+            if transcript_turn_count is not None:
+                payload["transcriptTurnCount"] = transcript_turn_count
 
             # Serialize payload to match EXACT bytes sent over the wire
             payload_bytes = json.dumps(payload, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
@@ -270,7 +331,11 @@ def _legacy_ai_config(metadata: dict | None = None) -> dict:
     tts_provider = _normalize_string(metadata.get("ttsProvider"), DEFAULT_TTS_PROVIDER).lower()
     tts_voice = _normalize_string(metadata.get("ttsVoiceId") or metadata.get("speaker"), DEFAULT_TTS_VOICE_ID)
 
-    stt_provider = "deepgram" if stt_model == "deepgram" else "openai"
+    stt_provider = (
+        stt_model
+        if stt_model in ("openai", "deepgram", "smallest", "assemblyai", "sarvam")
+        else "openai"
+    )
     llm_provider = "openai" if llm_model.startswith("gpt-") else "anthropic"
     if llm_model.startswith("gemini"):
         llm_provider = "google"
@@ -940,8 +1005,14 @@ def prewarm(proc: JobProcess) -> None:
 
     On LiveKit Cloud the worker is long-lived and handles many calls, so loading
     the VAD here (instead of per-session) cuts per-call cold-start latency.
+    Telephony-tuned params match narrowband 8 kHz SIP audio.
     """
-    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.2,
+        min_silence_duration=0.5,
+        padding_duration=0.1,
+        sample_rate=8000,
+    )
 
 
 # ── Agent server ──────────────────────────────────────────────────────────────
@@ -1056,7 +1127,7 @@ async def entrypoint(ctx: agents.JobContext):
         ),
     )
 
-    # Track whether we already reported the outcome (to avoid duplicate webhooks)
+    call_connected = False
     outcome_reported = False
     sip_call_uuid = None  # Vobiz call_uuid captured from SIP participant attributes
 
@@ -1093,22 +1164,29 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             logger.warning(f"Could not capture call_uuid: {e}")
 
-    async def _safe_report(outcome: str, dur: int = None):
-        """Report outcome exactly once — includes transcript and call_uuid."""
+    async def _safe_report(forced_outcome: str = None, dur: int = None):
+        """Classify transcript quality, then report outcome exactly once."""
         nonlocal outcome_reported
         if outcome_reported or not schedule_id:
             return
         outcome_reported = True
         try:
             transcript = _collect_transcript(session)
-            logger.info(f"Collected transcript with {len(transcript)} turns")
+            classified_outcome, user_turns, word_count = _classify_outcome(transcript, call_connected)
+            final_outcome = forced_outcome if forced_outcome else classified_outcome
+            logger.info(
+                f"Collected transcript: {len(transcript)} turns, candidate turns: {user_turns}, "
+                f"words: {word_count} → outcome: {final_outcome}"
+            )
             await report_outcome(
                 schedule_id,
-                outcome,
+                final_outcome,
                 duration=dur,
                 call_uuid=sip_call_uuid,
                 transcript=transcript,
                 webhook_url=call_webhook_url,
+                candidate_word_count=word_count,
+                transcript_turn_count=len(transcript),
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
@@ -1133,7 +1211,7 @@ async def entrypoint(ctx: agents.JobContext):
         if schedule_id and not outcome_reported:
             try:
                 duration = int(time.time() - agent._call_start_time)
-                asyncio.create_task(_safe_report("COMPLETED", duration))
+                asyncio.create_task(_safe_report(dur=duration))
             except Exception as e:
                 logger.error(f"Error sending disconnect webhook: {e}")
 
@@ -1146,7 +1224,7 @@ async def entrypoint(ctx: agents.JobContext):
                 duration = int(time.time() - agent._call_start_time)
             except Exception:
                 duration = 0
-            asyncio.create_task(_safe_report("COMPLETED", duration))
+            asyncio.create_task(_safe_report(dur=duration))
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
@@ -1205,20 +1283,6 @@ async def entrypoint(ctx: agents.JobContext):
             ctx.shutdown()
             return
         try:
-            has_custom_prompt = prompt_text and prompt_text.strip() != ""
-            greeting_instructions = (
-                "The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
-                if has_custom_prompt
-                else "The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
-            )
-
-            # Pre-generate the greeting while the phone is ringing so TTS audio
-            # is buffered and plays immediately when the call is answered.
-            # generate_reply() returns a SpeechHandle and schedules generation
-            # internally — no await/create_task needed.
-            session.generate_reply(instructions=greeting_instructions)
-
-            # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=ctx.room.name,
@@ -1229,15 +1293,43 @@ async def entrypoint(ctx: agents.JobContext):
                 )
             )
             logger.info("Call answered! Agent is now listening.")
+            call_connected = True
 
-            # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
-            
+
+            has_custom_prompt = prompt_text and prompt_text.strip() != ""
+            if has_custom_prompt:
+                await session.generate_reply(
+                    instructions=(
+                        "The candidate has answered. Greet them warmly and begin the interview "
+                        "as described in your instructions."
+                    )
+                )
+            else:
+                await session.generate_reply(
+                    instructions=(
+                        "The candidate has answered. Greet them with exactly: Hello, this is priya "
+                        "calling from Bhanzu. I'm reaching out regarding your application for the "
+                        "Business Development Associate role. Is this a good time to talk?"
+                    )
+                )
+
         except Exception as e:
+            err_str = str(e).lower()
             logger.error(f"Failed to place outbound call: {e}")
             if schedule_id:
-                await report_outcome(schedule_id, "NO_ANSWER", webhook_url=call_webhook_url)
-            # Ensure we clean up if the call fails
+                if "603" in err_str or "decline" in err_str or "rejected" in err_str:
+                    outcome = "CALL_REJECTED"
+                elif "invalid" in err_str or "404" in err_str or "480" in err_str or "not found" in err_str:
+                    outcome = "INVALID_NUMBER"
+                else:
+                    outcome = "NO_ANSWER"
+                await report_outcome(
+                    schedule_id,
+                    outcome,
+                    error_message=str(e),
+                    webhook_url=call_webhook_url,
+                )
             ctx.shutdown()
     else:
         # Fallback for inbound calls (if this agent is used for that)

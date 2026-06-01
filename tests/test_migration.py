@@ -64,3 +64,51 @@ def test_normalize_ai_config_defaults():
     assert "provider" in cfg["stt"]
     assert "provider" in cfg["llm"]
     assert "provider" in cfg["tts"]
+
+
+def test_classify_outcome_no_answer_when_not_connected():
+    outcome, turns, words = agent._classify_outcome([], connected=False)
+    assert outcome == "NO_ANSWER"
+    assert turns == 0
+    assert words == 0
+
+
+def test_classify_outcome_voicemail():
+    transcript = [
+        {"role": "agent", "text": "Hello?"},
+        {"role": "user", "text": "The person you are trying to reach is not available."},
+    ]
+    outcome, turns, words = agent._classify_outcome(transcript, connected=True)
+    assert outcome == "VOICEMAIL"
+    assert turns == 1
+
+
+def test_classify_outcome_premature_disconnect():
+    transcript = [
+        {"role": "agent", "text": "Hello, is this a good time?"},
+        {"role": "user", "text": "No thanks bye"},
+    ]
+    outcome, _, words = agent._classify_outcome(transcript, connected=True)
+    assert outcome == "PREMATURE_DISCONNECT"
+    assert words < agent.MIN_CANDIDATE_WORDS_FOR_EVAL
+
+
+def test_classify_outcome_completed():
+    transcript = [
+        {"role": "agent", "text": "Tell me about yourself."},
+        {
+            "role": "user",
+            "text": (
+                "I have five years of experience in business development and sales "
+                "across edtech and SaaS companies in Bangalore."
+            ),
+        },
+    ]
+    outcome, _, words = agent._classify_outcome(transcript, connected=True)
+    assert outcome == "COMPLETED"
+    assert words >= agent.MIN_CANDIDATE_WORDS_FOR_EVAL
+
+
+def test_legacy_ai_config_supports_smallest_stt():
+    cfg = agent._legacy_ai_config({"sttModel": "smallest"})
+    assert cfg["stt"]["provider"] == "smallest"
