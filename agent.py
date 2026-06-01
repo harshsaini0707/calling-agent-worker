@@ -8,18 +8,55 @@ import hashlib
 from dotenv import load_dotenv
 import aiohttp
 from livekit import agents, api, rtc
-from livekit.agents import AgentSession, Agent, RoomInputOptions, get_job_context, function_tool, RunContext, TurnHandlingOptions
+from livekit.agents import (
+    Agent,
+    AgentServer,
+    AgentSession,
+    EndpointingOptions,
+    InterruptionOptions,
+    JobProcess,
+    RoomInputOptions,
+    RunContext,
+    TurnHandlingOptions,
+    function_tool,
+    get_job_context,
+)
 from livekit.plugins import (
     openai,
-    # smallestai,
-    # cartesia,
+    deepgram,
     sarvam,
     anthropic,
-    # noise_cancellation,  
     silero,
 )
 from livekit.agents import llm
 from typing import Annotated, Optional
+
+try:
+    from livekit.agents import inference
+except ImportError:
+    inference = None
+
+# Telephony-grade noise cancellation. Kept optional so local dev without the
+# plugin installed still imports; BVCTelephony is enabled when present (see entrypoint).
+try:
+    from livekit.plugins import noise_cancellation
+except ImportError:
+    noise_cancellation = None
+
+try:
+    from livekit.plugins import assemblyai
+except ImportError:
+    assemblyai = None
+
+try:
+    from livekit.plugins import cartesia
+except ImportError:
+    cartesia = None
+
+try:
+    from livekit.plugins import elevenlabs
+except ImportError:
+    elevenlabs = None
 
 # Load environment variables
 load_dotenv(".env")
@@ -35,6 +72,37 @@ OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
+DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "openai").strip() or "openai"
+DEFAULT_OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
+DEFAULT_DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3").strip() or "nova-3"
+DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
+DEFAULT_TTS_PROVIDER = os.getenv("DEFAULT_TTS_PROVIDER", "sarvam").strip() or "sarvam"
+DEFAULT_TTS_VOICE_ID = os.getenv("SARVAM_TTS_SPEAKER", "simran").strip() or "simran"
+DEFAULT_TTS_LANGUAGE = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
+DEFAULT_TTS_PACE = os.getenv("SARVAM_TTS_PACE", "0.95").strip() or "0.95"
+DEFAULT_AI_CONFIG = {
+    "version": 2,
+    "stt": {
+        "provider": DEFAULT_STT_PROVIDER,
+        "model": DEFAULT_OPENAI_STT_MODEL if DEFAULT_STT_PROVIDER == "openai" else DEFAULT_DEEPGRAM_STT_MODEL,
+        "language": "en-IN" if DEFAULT_STT_PROVIDER == "deepgram" else "en",
+        "options": {},
+    },
+    "llm": {
+        "provider": "openai" if DEFAULT_LLM_MODEL.startswith("gpt-") else "anthropic",
+        "model": DEFAULT_LLM_MODEL,
+        "temperature": 0.4,
+        "options": {},
+    },
+    "tts": {
+        "provider": DEFAULT_TTS_PROVIDER,
+        "model": "bulbul",
+        "voice": DEFAULT_TTS_VOICE_ID,
+        "language": DEFAULT_TTS_LANGUAGE,
+        "pace": 0.95,
+        "options": {},
+    },
+}
 
 REQUIRED_RUNTIME_ENV_KEYS = [
     "LIVEKIT_URL",
@@ -43,7 +111,6 @@ REQUIRED_RUNTIME_ENV_KEYS = [
     "OPENAI_API_KEY",
     "SARVAM_API_KEY",
     "OUTBOUND_TRUNK_ID",
-    "BACKEND_WEBHOOK_URL",
 ]
 
 
@@ -59,6 +126,19 @@ def validate_runtime_env():
             ", ".join(missing_keys),
         )
         return False
+
+    if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
+        logger.error(
+            "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
+            BACKEND_WEBHOOK_URL,
+        )
+        return False
+
+    if BACKEND_WEBHOOK_URL.startswith("http://") and not BACKEND_WEBHOOK_URL.startswith("http://host.docker.internal"):
+        logger.warning(
+            "BACKEND_WEBHOOK_URL=%s uses plain HTTP. If the server redirects to HTTPS, the POST will become a GET and return 405. Use https:// instead.",
+            BACKEND_WEBHOOK_URL,
+        )
 
     return True
 
@@ -164,10 +244,12 @@ async def report_outcome(
     error_message: str = None,
     candidate_word_count: int = None,
     transcript_turn_count: int = None,
+    webhook_url: str = None,
 ):
     if not schedule_id:
         return
-    logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id}")
+    target_url = webhook_url or BACKEND_WEBHOOK_URL
+    logger.info(f"Reporting {outcome} to webhook for schedule_id {schedule_id} → {target_url}")
     try:
         async with aiohttp.ClientSession() as http_session:
             payload = {"scheduleId": schedule_id, "outcome": outcome}
@@ -204,9 +286,13 @@ async def report_outcome(
             # else:
             #     logger.warning("CALL_SCREENING_WEBHOOK_SECRET is not configured; webhook auth will fail against hardened backend")
 
-            async with http_session.post(BACKEND_WEBHOOK_URL, data=payload_bytes, headers=headers) as resp:
+            async with http_session.post(target_url, data=payload_bytes, headers=headers, allow_redirects=False) as resp:
                 response_body = await resp.text()
-                logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
+                if resp.status in (301, 302, 307, 308):
+                    location = resp.headers.get("Location", "")
+                    logger.error(f"Webhook URL redirected ({resp.status}) to {location} — update webhook_url in dispatch metadata or BACKEND_WEBHOOK_URL env to avoid redirect")
+                else:
+                    logger.info(f"Webhook response: {resp.status} — {response_body[:200]}")
     except Exception as e:
         logger.error(f"Webhook failed: {e}")
 
@@ -216,23 +302,183 @@ def get_bulbul_model(speaker: str) -> str:
     return "bulbul:v2" if speaker in v2_speakers else "bulbul:v3-beta"
 
 
-def _build_tts():
-    """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
-
-    # return smallestai.TTS(
-    #     voice_id="yuvika",
-    #     language="en-IN"
-    # )
-
-    speaker = os.getenv("SARVAM_TTS_SPEAKER", "shreya").strip() or "shreya"
-    language_code = os.getenv("SARVAM_TTS_LANGUAGE", "en-IN").strip() or "en-IN"
-    pace_raw = os.getenv("SARVAM_TTS_PACE", "1.0").strip() or "1.0"
-
+def _coerce_tts_pace(value: str) -> float:
     try:
-        pace = float(pace_raw)
+        return float(value)
     except ValueError:
-        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 1.0.", pace_raw)
-        pace = 1.0
+        logger.warning("Invalid SARVAM_TTS_PACE=%s. Falling back to 0.95.", value)
+        return 0.95
+
+
+DEFAULT_AI_CONFIG["tts"]["pace"] = _coerce_tts_pace(DEFAULT_TTS_PACE)
+
+
+def _normalize_string(value, fallback: str) -> str:
+    normalized = str(value or "").strip()
+    return normalized or fallback
+
+
+def _legacy_ai_config(metadata: dict | None = None) -> dict:
+    metadata = metadata or {}
+    stt_model = _normalize_string(metadata.get("sttModel"), DEFAULT_STT_PROVIDER).lower()
+    llm_model = _normalize_string(metadata.get("llmModel"), DEFAULT_LLM_MODEL)
+    tts_provider = _normalize_string(metadata.get("ttsProvider"), DEFAULT_TTS_PROVIDER).lower()
+    tts_voice = _normalize_string(metadata.get("ttsVoiceId") or metadata.get("speaker"), DEFAULT_TTS_VOICE_ID)
+
+    stt_provider = "deepgram" if stt_model == "deepgram" else "openai"
+    llm_provider = "openai" if llm_model.startswith("gpt-") else "anthropic"
+    if llm_model.startswith("gemini"):
+        llm_provider = "google"
+
+    tts_default_models = {
+        "sarvam": "bulbul",
+        "elevenlabs": "eleven_turbo_v2_5",
+        "cartesia": "sonic-3",
+        "deepgram": "aura-2",
+        "livekit-inference": "cartesia/sonic-3",
+    }
+
+    return {
+        "version": 2,
+        "stt": {
+            **DEFAULT_AI_CONFIG["stt"],
+            "provider": stt_provider,
+            "model": DEFAULT_DEEPGRAM_STT_MODEL if stt_provider == "deepgram" else DEFAULT_OPENAI_STT_MODEL,
+            "language": "en-IN" if stt_provider == "deepgram" else "en",
+        },
+        "llm": {
+            **DEFAULT_AI_CONFIG["llm"],
+            "provider": llm_provider,
+            "model": llm_model,
+        },
+        "tts": {
+            **DEFAULT_AI_CONFIG["tts"],
+            "provider": tts_provider,
+            "model": tts_default_models.get(tts_provider, "bulbul"),
+            "voice": tts_voice,
+        },
+    }
+
+
+def _normalize_ai_config(metadata: dict | None = None) -> dict:
+    metadata = metadata or {}
+    source = metadata.get("aiConfig")
+    if not isinstance(source, dict):
+        return _legacy_ai_config(metadata)
+
+    return {
+        "version": 2,
+        "stt": {**DEFAULT_AI_CONFIG["stt"], **(source.get("stt") or {})},
+        "llm": {**DEFAULT_AI_CONFIG["llm"], **(source.get("llm") or {})},
+        "tts": {**DEFAULT_AI_CONFIG["tts"], **(source.get("tts") or {})},
+    }
+
+
+def _inference_available(kind: str) -> bool:
+    if inference is not None:
+        return True
+    logger.warning("LiveKit Inference %s requested but this livekit-agents version has no inference module.", kind)
+    return False
+
+
+def _build_stt(ai_config: dict):
+    config = ai_config.get("stt", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_AI_CONFIG["stt"]["provider"]).lower()
+    model = _normalize_string(config.get("model"), DEFAULT_AI_CONFIG["stt"]["model"])
+    language = _normalize_string(config.get("language"), DEFAULT_AI_CONFIG["stt"]["language"])
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
+
+    if provider == "livekit-inference" and _inference_available("STT"):
+        logger.info("Using LiveKit Inference STT: model=%s language=%s", model, language)
+        return inference.STT(model=model, language=language, extra_kwargs=options)
+
+    if provider == "deepgram":
+        if os.getenv("DEEPGRAM_API_KEY"):
+            logger.info("Using Deepgram STT: model=%s language=%s", model, language)
+            return deepgram.STT(model=model, language=language)
+        logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
+
+    if provider == "assemblyai" and assemblyai is not None:
+        logger.info("Using AssemblyAI STT: model=%s language=%s", model, language)
+        return assemblyai.STT(model=model, language=language)
+
+    if provider == "sarvam" and hasattr(sarvam, "STT"):
+        logger.info("Using Sarvam STT: model=%s language=%s", model, language)
+        return sarvam.STT(model=model, language=language)
+
+    if provider not in ("openai", "deepgram"):
+        logger.warning("Unsupported or unavailable STT provider requested: %s. Falling back to OpenAI.", provider)
+
+    logger.info("Using OpenAI STT: model=%s language=%s", DEFAULT_OPENAI_STT_MODEL, "en")
+    return openai.STT(model=DEFAULT_OPENAI_STT_MODEL, language="en")
+
+
+def _build_llm(ai_config: dict):
+    config = ai_config.get("llm", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_AI_CONFIG["llm"]["provider"]).lower()
+    model = _normalize_string(config.get("model"), DEFAULT_LLM_MODEL)
+    temperature = config.get("temperature", DEFAULT_AI_CONFIG["llm"]["temperature"])
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
+
+    if provider == "livekit-inference" and _inference_available("LLM"):
+        extra_kwargs = {"temperature": temperature, **options}
+        logger.info("Using LiveKit Inference LLM: model=%s", model)
+        return inference.LLM(model=model, extra_kwargs=extra_kwargs)
+
+    if provider == "openai":
+        logger.info("Using OpenAI LLM: model=%s", model)
+        responses_api = getattr(openai, "responses", None)
+        if responses_api and hasattr(responses_api, "LLM"):
+            return responses_api.LLM(model=model, temperature=temperature)
+        return openai.LLM(model=model, temperature=temperature)
+
+    if provider == "openrouter":
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if api_key:
+            logger.info("Using OpenRouter LLM: model=%s", model)
+            return openai.LLM(model=model, base_url="https://openrouter.ai/api/v1", api_key=api_key, temperature=temperature)
+        logger.warning("OpenRouter LLM requested but OPENROUTER_API_KEY is not configured; falling back to Anthropic")
+
+    if provider == "google":
+        logger.warning("Google Gemini LLM requested but this worker does not load the Gemini plugin yet; falling back to Anthropic")
+
+    if provider not in ("anthropic", "openrouter", "google"):
+        logger.warning("Unsupported LLM provider requested: %s. Falling back to Anthropic.", provider)
+
+    logger.info("Using Anthropic LLM: model=%s", DEFAULT_LLM_MODEL)
+    return anthropic.LLM(model=DEFAULT_LLM_MODEL, temperature=min(float(temperature), 1.0))
+
+
+def _build_tts(ai_config: dict):
+    """Configure the Text-to-Speech provider using Sarvam Bulbul voices."""
+    config = ai_config.get("tts", {})
+    provider = _normalize_string(config.get("provider"), DEFAULT_TTS_PROVIDER).lower()
+    model = _normalize_string(config.get("model"), "bulbul")
+    voice = _normalize_string(config.get("voice") or config.get("voiceId"), DEFAULT_TTS_VOICE_ID)
+    language_code = _normalize_string(config.get("language"), DEFAULT_TTS_LANGUAGE)
+    pace = _coerce_tts_pace(str(config.get("pace", DEFAULT_TTS_PACE)))
+    options = config.get("options") if isinstance(config.get("options"), dict) else {}
+
+    if provider == "livekit-inference" and _inference_available("TTS"):
+        logger.info("Using LiveKit Inference TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return inference.TTS(model=model, voice=voice, language=language_code, extra_kwargs=options)
+
+    if provider == "elevenlabs" and elevenlabs is not None:
+        logger.info("Using ElevenLabs TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return elevenlabs.TTS(model=model, voice_id=voice, language=language_code)
+
+    if provider == "cartesia" and cartesia is not None:
+        logger.info("Using Cartesia TTS: model=%s voice=%s language=%s", model, voice, language_code)
+        return cartesia.TTS(model=model, voice=voice, language=language_code)
+
+    if provider == "deepgram":
+        logger.info("Using Deepgram TTS: model=%s voice=%s", model, voice)
+        return deepgram.TTS(model=f"{model}-{voice}" if voice and voice not in model else model)
+
+    if provider != "sarvam":
+        logger.warning("Unsupported or unavailable TTS provider requested: %s. Falling back to Sarvam.", provider)
+
+    speaker = voice.strip().lower() or DEFAULT_TTS_VOICE_ID
 
     model = get_bulbul_model(speaker)
     logger.info(
@@ -247,8 +493,9 @@ def _build_tts():
         model=model,
         speaker=speaker,
         pace=pace,
-        output_audio_codec="mp3",
+        output_audio_codec="mulaw",
         speech_sample_rate=8000,
+        min_buffer_size=30,
     )
 
 
@@ -730,6 +977,24 @@ async def hangup_call():
     )
 
 
+# ── LiveKit prewarm ───────────────────────────────────────────────────────────
+def prewarm(proc: JobProcess) -> None:
+    """Load the Silero VAD once per worker process and reuse across jobs.
+
+    On LiveKit Cloud the worker is long-lived and handles many calls, so loading
+    the VAD here (instead of per-session) cuts per-call cold-start latency.
+    """
+    proc.userdata["vad"] = silero.VAD.load()
+
+
+# ── Agent server ──────────────────────────────────────────────────────────────
+# agent_name MUST stay "outbound-caller": the backend/make_call dispatch targets
+# this name to place outbound SIP calls. Do not rename.
+server = AgentServer()
+server.setup_fnc = prewarm
+
+
+@server.rtc_session(agent_name="outbound-caller")
 async def entrypoint(ctx: agents.JobContext):
     """
     Main entrypoint for the agent.
@@ -756,6 +1021,8 @@ async def entrypoint(ctx: agents.JobContext):
     jd_text = "Not provided."
     prompt_text = ""
     total_minutes = 10
+    ai_config = DEFAULT_AI_CONFIG
+    call_webhook_url = None
     try:
         if ctx.job.metadata:
             data = json.loads(ctx.job.metadata)
@@ -766,6 +1033,8 @@ async def entrypoint(ctx: agents.JobContext):
             resume_text = data.get("resume", "Not provided.")
             jd_text = data.get("jd", "Not provided.")
             total_minutes = int(data.get("total_minutes", 10))
+            ai_config = _normalize_ai_config(data)
+            call_webhook_url = data.get("webhook_url") or None
 
             normalized_prompt = str(raw_prompt or "").strip()
             if normalized_prompt:
@@ -783,18 +1052,24 @@ async def entrypoint(ctx: agents.JobContext):
     # Initialize the Agent Session with plugins
 
     session = AgentSession(
-        vad=silero.VAD.load(
-            min_speech_duration=0.2,
-            min_silence_duration=0.5,
-            padding_duration=0.1,
-            sample_rate=8000,
-        ),
-        stt=openai.STT(model="gpt-4o-mini-transcribe", language="en"),
-        llm=anthropic.LLM(model="claude-haiku-4-5"),
-        tts=_build_tts(),
+        # Silero VAD (required for non-streaming STT), prewarmed once per process.
+        vad=ctx.proc.userdata["vad"],
+        stt=_build_stt(ai_config),
+        llm=_build_llm(ai_config),
+        tts=_build_tts(ai_config),
         userdata=fnc_ctx,
         turn_handling=TurnHandlingOptions(
-            interruption={"mode": "adaptive"},
+            # min_delay 1.0s (up from the 0.5s default) so a thinking-pause mid-answer
+            # isn't treated as end-of-turn — the agent was cutting candidates off.
+            # max_delay 3.0s is the hard cap before the turn is forced closed.
+            # Telephony note: phone audio is noisier/laggier than web; 1.0s is a sane
+            # starting point. Tune up if cut-offs persist on real calls.
+            endpointing=EndpointingOptions(min_delay=1.0, max_delay=3.0),
+            # adaptive interruption distinguishes real interruptions from backchannel
+            # ("mm-hm", "okay"); min_duration 0.5s ignores brief blips/line noise.
+            interruption=InterruptionOptions(mode="adaptive", min_duration=0.5),
+            # Keep preemptive generation for snappy replies.
+            preemptive_generation={"enabled": True, "preemptive_tts": True},
         ),
     )
 
@@ -807,11 +1082,19 @@ async def entrypoint(ctx: agents.JobContext):
         prompt_text=prompt_text,
         total_minutes=total_minutes,
     )
+    # BVCTelephony is the phone-tuned noise-cancellation model (narrowband SIP audio).
+    # Do NOT use ai_coustics QUAIL here — that targets wideband web audio.
+    nc = noise_cancellation.BVCTelephony() if noise_cancellation is not None else None
+    if nc is None:
+        logger.warning(
+            "noise_cancellation plugin unavailable; running without BVCTelephony"
+        )
+
     await session.start(
         room=ctx.room,
         agent=agent,
         room_input_options=RoomInputOptions(
-            # noise_cancellation=noise_cancellation.BVCTelephony(), 
+            noise_cancellation=nc,
             close_on_disconnect=True,
         ),
     )
@@ -875,6 +1158,7 @@ async def entrypoint(ctx: agents.JobContext):
                 transcript=transcript,
                 candidate_word_count=word_count,
                 transcript_turn_count=len(transcript),
+                webhook_url=call_webhook_url,
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
@@ -969,10 +1253,23 @@ async def entrypoint(ctx: agents.JobContext):
         if not OUTBOUND_TRUNK_ID:
             logger.error("OUTBOUND_TRUNK_ID is missing. Cannot place outbound SIP call.")
             if schedule_id:
-                await report_outcome(schedule_id, "FAILED")
+                await report_outcome(schedule_id, "FAILED", webhook_url=call_webhook_url)
             ctx.shutdown()
             return
         try:
+            has_custom_prompt = prompt_text and prompt_text.strip() != ""
+            greeting_instructions = (
+                "The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
+                if has_custom_prompt
+                else "The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
+            )
+
+            # Pre-generate the greeting while the phone is ringing so TTS audio
+            # is buffered and plays immediately when the call is answered.
+            # generate_reply() returns a SpeechHandle and schedules generation
+            # internally — no await/create_task needed.
+            session.generate_reply(instructions=greeting_instructions)
+
             # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
@@ -989,17 +1286,6 @@ async def entrypoint(ctx: agents.JobContext):
             # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
             
-            # Use appropriate greeting based on which prompt mode is active
-            has_custom_prompt = prompt_text and prompt_text.strip() != ""
-            if has_custom_prompt:
-                await session.generate_reply(
-                    instructions="The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
-                )
-            else:
-                await session.generate_reply(
-                    instructions="The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
-                )
-            
         except Exception as e:
             err_str = str(e).lower()
             logger.error(f"Failed to place outbound call: {e}")
@@ -1011,7 +1297,8 @@ async def entrypoint(ctx: agents.JobContext):
                     outcome = "INVALID_NUMBER"
                 else:
                     outcome = "NO_ANSWER"
-                await report_outcome(schedule_id, outcome, error_message=str(e))
+                await report_outcome(schedule_id, outcome, error_message=str(e), webhook_url=call_webhook_url)
+            # Ensure we clean up if the call fails
             ctx.shutdown()
     else:
         # Fallback for inbound calls (if this agent is used for that)
@@ -1020,10 +1307,6 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
-    # The agent name "outbound-caller" is used by the dispatch script to find this worker
-    agents.cli.run_app(
-        agents.WorkerOptions(
-            entrypoint_fnc=entrypoint,
-            agent_name="outbound-caller", 
-        )
-    )
+    # agent_name "outbound-caller" is set on the @server.rtc_session decorator above;
+    # the dispatch script / backend uses that name to find this worker.
+    agents.cli.run_app(server)

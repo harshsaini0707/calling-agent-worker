@@ -1,4 +1,11 @@
 # syntax=docker/dockerfile:1
+# Local-only Dockerfile optimized for fast rebuilds.
+# Deps are system-installed (not into a .venv) from pyproject.toml so the
+# `.:/app` bind mount in docker-compose.local.yml cannot shadow them, and the
+# container keeps running `python agent.py` directly.
+#
+# Usage:
+#   docker compose -f docker-compose.local.yml up --build
 FROM python:3.12-slim
 
 WORKDIR /app
@@ -12,13 +19,18 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 RUN pip install --no-cache-dir uv
 
-COPY requirements.txt ./
+# Install prod + dev deps from the lock, system-wide (no .venv to be shadowed by
+# the `.:/app` bind mount). Export from uv.lock so versions match the prod build.
+# livekit-plugins-sarvam is now on PyPI (>=1.5.9) — no git install step needed.
+COPY pyproject.toml uv.lock ./
 RUN --mount=type=cache,target=/root/.cache/uv,id=telephony-agent-uv-cache,sharing=locked \
-    uv pip install --system -r requirements.txt
+    uv export --frozen --no-emit-project \
+      --extra assemblyai --extra cartesia --extra elevenlabs --extra dev \
+      --format requirements-txt -o /tmp/requirements.txt \
+    && uv pip install --system -r /tmp/requirements.txt
 
-RUN --mount=type=cache,target=/root/.cache/uv,id=telephony-agent-uv-cache,sharing=locked \
-    uv pip install --system --no-deps \
-    "livekit-plugins-sarvam @ git+https://github.com/livekit/agents.git@f1cd8b217e29d39b0dc21fd5d0cb165a193e8ec2#subdirectory=livekit-plugins/livekit-plugins-sarvam"
+# Bake the Silero VAD model so there's no first-start download delay.
+RUN python -m livekit.agents download-files
 
 ENV PYTHONUNBUFFERED=1
 

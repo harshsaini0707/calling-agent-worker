@@ -1,0 +1,44 @@
+[project]
+name = "zariya-telephony-agent"
+version = "0.1.0"
+description = "LiveKit outbound SIP caller (outbound-caller) for candidate phone screening."
+requires-python = ">=3.11"
+dependencies = [
+    # Core agent framework — pinned for reproducible LK Cloud builds.
+    # Extras map to the plugins imported unconditionally in agent.py.
+    "livekit-agents[anthropic,openai,deepgram,silero]==1.5.12",
+    # Sarvam Bulbul TTS (en-IN voices) — published build (replaces the old git pin).
+    "livekit-plugins-sarvam>=1.5.9,<2.0.0",
+    # Telephony-grade noise cancellation (BVCTelephony, narrowband SIP audio).
+    "livekit-plugins-noise-cancellation",
+    # Webhook reporting back to the backend.
+    "aiohttp>=3.10.0,<4.0.0",
+    "python-dotenv>=1.0.0,<2.0.0",
+]
+
+[project.optional-dependencies]
+# Optional STT/TTS providers — loaded via try/except in agent.py, absent by default.
+assemblyai = ["livekit-plugins-assemblyai>=1.5.0,<2.0.0"]
+cartesia = ["livekit-plugins-cartesia>=1.5.0,<2.0.0"]
+elevenlabs = ["livekit-plugins-elevenlabs>=1.5.0,<2.0.0"]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-mock>=3.12.0",
+    "ruff>=0.4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "N", "B", "A", "C4", "UP", "SIM", "RUF"]
+ignore = ["E501"]

@@ -87,6 +87,17 @@ Typical metadata includes:
 - `jd`
 - `total_minutes`
 - `templateQuestions`
+- `aiConfigVersion` (`2` for structured model configuration)
+- `aiConfig.stt.provider/model/language/options`
+- `aiConfig.llm.provider/model/temperature/options`
+- `aiConfig.tts.provider/model/voice/language/pace/options`
+- `sttModel` (`openai` default, `deepgram` supported when configured)
+- `ttsProvider` (`sarvam` default; unsupported values fall back to Sarvam)
+- `ttsVoiceId` (Sarvam speaker id, defaults to `simran`)
+- `llmModel` (`claude-haiku-4-5` default; `gpt-*` routes to OpenAI)
+- `webhook_url` (full URL to POST call outcome back to; falls back to `BACKEND_WEBHOOK_URL` env var when absent)
+
+Prefer `aiConfig` for new dispatches. The flat model fields remain as legacy fallback.
 
 Webhook payload sent back by this repo:
 

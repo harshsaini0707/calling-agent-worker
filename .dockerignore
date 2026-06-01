@@ -1,8 +1,29 @@
-.git
+.git/
+.github/
 .gitignore
-.env
-.venv
-__pycache__
+
+# Secrets / local env
+.env*
+env.zip
+
+# Python caches and local venvs
+.venv/
+venv/
+__pycache__/
+**/__pycache__/
 *.pyc
 *.pyo
 *.pyd
+**/.pytest_cache
+
+# Baked-in-image artifacts (downloaded during build, not from source)
+models/
+
+# Tests and docs aren't needed in the runtime image
+tests/
+*.md
+
+# Build/compose tooling
+Dockerfile*
+docker-compose*
+railway.toml
