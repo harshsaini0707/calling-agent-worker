@@ -142,38 +142,50 @@ def validate_runtime_env():
 
     return True
 
-def _get_messages(session):
-    """Safely extract messages from session depending on LiveKit version."""
-    try:
-        if hasattr(session, 'history'):
-            if hasattr(session.history, 'messages'):
-                return session.history.messages() if callable(session.history.messages) else session.history.messages
-            elif callable(session.history):
-                h = session.history()
-                if hasattr(h, 'messages'):
-                    return h.messages() if callable(h.messages) else h.messages
-        elif hasattr(session, 'chat_ctx') and hasattr(session.chat_ctx, 'messages'):
-            return session.chat_ctx.messages() if callable(session.chat_ctx.messages) else session.chat_ctx.messages
-    except Exception as e:
-        logger.debug(f"Error getting messages: {e}")
-    return []
-
 def _collect_transcript(session) -> list:
-    """Extract full conversation as [{role, text}] from session history."""
+    """Extract full conversation as [{role, text}] from session history.
+
+    LiveKit 1.5.x exposes conversation via ``session.history`` which is a
+    ``ChatContext`` object.  The items live in ``.items`` (NOT ``.messages``).
+    Each item has ``.type`` (``"message"``, ``"function_call"``, etc.),
+    ``.role`` (``"assistant"`` / ``"user"`` / ``"system"``), and
+    ``.text_content`` for the textual payload.
+    """
     transcript = []
     try:
-        messages = _get_messages(session)
-        for msg in messages:
+        history = getattr(session, "history", None)
+        if history is None:
+            logger.warning("session.history is None — cannot collect transcript")
+            return transcript
+
+        items = getattr(history, "items", None)
+        if items is None:
+            logger.warning("session.history.items is None — cannot collect transcript")
+            return transcript
+
+        for item in items:
+            # Only pick up actual conversation messages, skip function_call /
+            # function_call_output / agent_handoff / system items.
+            item_type = getattr(item, "type", None)
+            if item_type != "message":
+                continue
+
+            role = getattr(item, "role", "unknown")
+            # Skip system-prompt messages — they are not part of the transcript
+            if role == "system":
+                continue
+
+            # .text_content is the canonical accessor in LK 1.5.x
             text = ""
-            if hasattr(msg, "content") and isinstance(msg.content, str):
-                text = msg.content
-            elif hasattr(msg, "text_content"):
-                text = msg.text_content
+            if hasattr(item, "text_content"):
+                text = item.text_content or ""
+            elif hasattr(item, "content") and isinstance(item.content, str):
+                text = item.content
             else:
-                text = str(msg)
+                text = str(item)
+
             text = text.strip()
             if text:
-                role = getattr(msg, "role", "unknown")
                 # Normalise LiveKit role names to agent/user
                 if role == "assistant":
                     role = "agent"
