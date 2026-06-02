@@ -7,6 +7,12 @@ import hmac
 import hashlib
 from dotenv import load_dotenv
 import aiohttp
+import imageio_ffmpeg
+from pydub import AudioSegment
+
+# Tell pydub exactly where the bundled ffmpeg is, bypassing system PATH
+AudioSegment.converter = imageio_ffmpeg.get_ffmpeg_exe()
+
 from livekit import agents, api, rtc
 from livekit.agents import (
     Agent,
@@ -127,12 +133,13 @@ def validate_runtime_env():
         )
         return False
 
-    if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
-        logger.error(
-            "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
-            BACKEND_WEBHOOK_URL,
-        )
-        return False
+    # Check removed to allow local  testing
+    # if BACKEND_WEBHOOK_URL.startswith("http://localhost"):
+    #     logger.error(
+    #         "BACKEND_WEBHOOK_URL=%s is not reachable from Docker local mode. Use host.docker.internal or a remote URL.",
+    #         BACKEND_WEBHOOK_URL,
+    #     )
+    #     return False
 
     if BACKEND_WEBHOOK_URL.startswith("http://") and not BACKEND_WEBHOOK_URL.startswith("http://host.docker.internal"):
         logger.warning(
@@ -156,23 +163,34 @@ def _collect_transcript(session) -> list:
         history = getattr(session, "history", None)
         if history is None:
             logger.warning("session.history is None — cannot collect transcript")
-            return transcript
+            # Fallback: try session.chat_ctx
+            history = getattr(session, "chat_ctx", None)
+            if history is None:
+                logger.warning("session.chat_ctx also None — no transcript source")
+                return transcript
 
         items = getattr(history, "items", None)
         if items is None:
-            logger.warning("session.history.items is None — cannot collect transcript")
+            logger.warning("history.items is None — cannot collect transcript")
             return transcript
 
-        for item in items:
-            # Only pick up actual conversation messages, skip function_call /
-            # function_call_output / agent_handoff / system items.
+        logger.info(f"[transcript-debug] history type={type(history).__name__}, items count={len(items)}")
+        for i, item in enumerate(items):
             item_type = getattr(item, "type", None)
-            if item_type != "message":
+            role = getattr(item, "role", "unknown")
+            # Debug: log every item so we can see what LK is providing
+            logger.info(f"[transcript-debug] item[{i}] type={item_type!r} (python type={type(item_type).__name__}) role={role!r}")
+
+            # Accept the item if type is "message" (string) or if the str()
+            # representation contains "message" (covers enum values like
+            # ChatItemType.MESSAGE).
+            type_str = str(item_type).lower() if item_type is not None else ""
+            if "message" not in type_str:
                 continue
 
-            role = getattr(item, "role", "unknown")
             # Skip system-prompt messages — they are not part of the transcript
-            if role == "system":
+            role_str = str(role).lower()
+            if "system" in role_str:
                 continue
 
             # .text_content is the canonical accessor in LK 1.5.x
@@ -187,11 +205,13 @@ def _collect_transcript(session) -> list:
             text = text.strip()
             if text:
                 # Normalise LiveKit role names to agent/user
-                if role == "assistant":
+                if "assistant" in role_str:
                     role = "agent"
+                elif "user" in role_str:
+                    role = "user"
                 transcript.append({"role": role, "text": text})
     except Exception as e:
-        logger.warning(f"Could not collect transcript: {e}")
+        logger.warning(f"Could not collect transcript: {e}", exc_info=True)
     return transcript
 
 
@@ -505,9 +525,6 @@ def _build_tts(ai_config: dict):
         model=model,
         speaker=speaker,
         pace=pace,
-        output_audio_codec="mulaw",
-        speech_sample_rate=8000,
-        min_buffer_size=30,
     )
 
 
@@ -1006,6 +1023,69 @@ server = AgentServer()
 server.setup_fnc = prewarm
 
 
+AMBIENT_PCM_DATA = None
+
+def init_ambient_audio(file_path: str, volume_reduction_db: int = 20):
+    """Load ambient audio into global memory once on startup."""
+    global AMBIENT_PCM_DATA
+    if not os.path.exists(file_path):
+        logger.warning(f"Ambient audio file not found: {file_path}")
+        return
+        
+    logger.info(f"Pre-loading ambient audio: {file_path}...")
+    audio_segment = AudioSegment.from_file(file_path) - volume_reduction_db
+    audio_segment = audio_segment.set_frame_rate(48000).set_channels(1).set_sample_width(2)
+    AMBIENT_PCM_DATA = audio_segment.raw_data
+    logger.info("Ambient audio loaded globally.")
+
+async def stream_ambient_audio(room: rtc.Room):
+    """Continuously stream global ambient audio to the room."""
+    if not AMBIENT_PCM_DATA:
+        return
+
+    source = rtc.AudioSource(sample_rate=48000, num_channels=1)
+    track = rtc.LocalAudioTrack.create_audio_track("ambient_noise", source)
+    
+    options = rtc.TrackPublishOptions(source=rtc.TrackSource.SOURCE_MICROPHONE)
+    await room.local_participant.publish_track(track, options)
+
+    samples_per_frame = 480  # 10ms at 48kHz
+    bytes_per_frame = samples_per_frame * 2
+    total_bytes = len(AMBIENT_PCM_DATA)
+    cursor = 0
+
+    start_time = time.time()
+    frames_sent = 0
+
+    try:
+        while True:
+            if cursor + bytes_per_frame > total_bytes:
+                cursor = 0 
+                
+            chunk = AMBIENT_PCM_DATA[cursor : cursor + bytes_per_frame]
+            cursor += bytes_per_frame
+
+            frame = rtc.AudioFrame(
+                data=chunk,
+                sample_rate=48000,
+                num_channels=1,
+                samples_per_channel=samples_per_frame
+            )
+            await source.capture_frame(frame)
+            frames_sent += 1
+
+            expected_time = start_time + (frames_sent * 0.01)
+            sleep_duration = expected_time - time.time()
+            
+            if sleep_duration > 0:
+                await asyncio.sleep(sleep_duration)
+            else:
+                await asyncio.sleep(0)
+                
+    except asyncio.CancelledError:
+        logger.info("Ambient audio streaming cancelled.")
+        pass
+
 @server.rtc_session(agent_name="outbound-caller")
 async def entrypoint(ctx: agents.JobContext):
     """
@@ -1149,14 +1229,23 @@ async def entrypoint(ctx: agents.JobContext):
         except Exception as e:
             logger.warning(f"Could not capture call_uuid: {e}")
 
-    async def _safe_report(forced_outcome: str = None, dur: int = None):
+        # Start ambient noise in the background
+        ambient_task = asyncio.create_task(
+            stream_ambient_audio(ctx.room)
+        )
+        # Save the task so we can cancel it when the call ends
+        agent._ambient_task = ambient_task
+
+    async def _safe_report(forced_outcome: str = None, dur: int = None, pre_collected_transcript: list = None):
         """Classify transcript quality, then report outcome exactly once."""
         nonlocal outcome_reported
         if outcome_reported or not schedule_id:
             return
         outcome_reported = True
         try:
-            transcript = _collect_transcript(session)
+            # Use pre-collected transcript if available (avoids race with session teardown),
+            # otherwise collect now as a fallback.
+            transcript = pre_collected_transcript if pre_collected_transcript is not None else _collect_transcript(session)
             classified_outcome, user_turns, word_count = _classify_outcome(transcript, call_connected)
             # If caller forces a specific outcome (e.g. NO_ANSWER, CALL_REJECTED) respect it
             # Otherwise use the classified outcome from transcript analysis
@@ -1192,11 +1281,17 @@ async def entrypoint(ctx: agents.JobContext):
     @ctx.room.on("participant_disconnected")
     def on_participant_disconnected(participant: rtc.RemoteParticipant):
         logger.info(f"Caller/Participant disconnected: {participant.identity}")
+        
+        # Cancel the looping audio when they hang up
+        if hasattr(agent, "_ambient_task") and not agent._ambient_task.done():
+            agent._ambient_task.cancel()
+            
         if schedule_id and not outcome_reported:
             try:
                 duration = int(time.time() - agent._call_start_time)
-                # Let _safe_report classify the transcript — no forced outcome
-                asyncio.create_task(_safe_report(dur=duration))
+                # Snapshot transcript NOW before the session tears down
+                transcript_snapshot = _collect_transcript(session)
+                asyncio.create_task(_safe_report(dur=duration, pre_collected_transcript=transcript_snapshot))
             except Exception as e:
                 logger.error(f"Error sending disconnect webhook: {e}")
 
@@ -1209,8 +1304,9 @@ async def entrypoint(ctx: agents.JobContext):
                 duration = int(time.time() - agent._call_start_time)
             except Exception:
                 duration = 0
-            # Let _safe_report classify — no forced outcome
-            asyncio.create_task(_safe_report(dur=duration))
+            # Snapshot transcript NOW before context is fully gone
+            transcript_snapshot = _collect_transcript(session)
+            asyncio.create_task(_safe_report(dur=duration, pre_collected_transcript=transcript_snapshot))
 
     # Auto-hangup: background task that monitors agent speech for farewell phrases
     FAREWELL_PHRASES = [
@@ -1250,7 +1346,8 @@ async def entrypoint(ctx: agents.JobContext):
                                     logger.info(f"Farewell detected in agent message: '{phrase}' — hanging up in 2s")
                                     await asyncio.sleep(2)
                                     duration = int(time.time() - agent._call_start_time)
-                                    await _safe_report("COMPLETED", duration)
+                                    transcript_snapshot = _collect_transcript(session)
+                                    await _safe_report("COMPLETED", duration, pre_collected_transcript=transcript_snapshot)
                                     await _end_call()
                                     return
                     checked_count = len(messages)
@@ -1319,6 +1416,10 @@ async def entrypoint(ctx: agents.JobContext):
 
 
 if __name__ == "__main__":
+    # Initialize the ambient background audio into global memory
+    ambient_file = os.path.join(os.path.dirname(__file__), "assets", "ambient_office.mp3")
+    init_ambient_audio(ambient_file, volume_reduction_db=0)
+
     # agent_name "outbound-caller" is set on the @server.rtc_session decorator above;
     # the dispatch script / backend uses that name to find this worker.
     agents.cli.run_app(server)
