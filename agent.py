@@ -55,6 +55,12 @@ except ImportError:
     assemblyai = None
 
 try:
+    from livekit.plugins import smallestai as _smallestai_plugin
+    SmallestSTT = _smallestai_plugin.STT
+except ImportError:
+    SmallestSTT = None
+
+try:
     from livekit.plugins import cartesia
 except ImportError:
     cartesia = None
@@ -78,7 +84,7 @@ OUTBOUND_TRUNK_ID = os.getenv("OUTBOUND_TRUNK_ID")
 SIP_DOMAIN = os.getenv("VOBIZ_SIP_DOMAIN") 
 BACKEND_WEBHOOK_URL = os.getenv("BACKEND_WEBHOOK_URL", "http://localhost:4000/api/call-screening/webhook/call-outcome")
 CALL_SCREENING_WEBHOOK_SECRET = os.getenv("CALL_SCREENING_WEBHOOK_SECRET", "").strip()
-DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "openai").strip() or "openai"
+DEFAULT_STT_PROVIDER = os.getenv("DEFAULT_STT_PROVIDER", "smallest").strip() or "smallest"
 DEFAULT_OPENAI_STT_MODEL = os.getenv("OPENAI_STT_MODEL", "gpt-4o-mini-transcribe").strip() or "gpt-4o-mini-transcribe"
 DEFAULT_DEEPGRAM_STT_MODEL = os.getenv("DEEPGRAM_STT_MODEL", "nova-3").strip() or "nova-3"
 DEFAULT_LLM_MODEL = os.getenv("DEFAULT_LLM_MODEL", "claude-haiku-4-5").strip() or "claude-haiku-4-5"
@@ -277,6 +283,9 @@ async def report_outcome(
     candidate_word_count: int = None,
     transcript_turn_count: int = None,
     webhook_url: str = None,
+    error_message: str = None,
+    candidate_word_count: int = None,
+    transcript_turn_count: int = None,
 ):
     if not schedule_id:
         return
@@ -357,7 +366,11 @@ def _legacy_ai_config(metadata: dict | None = None) -> dict:
     tts_provider = _normalize_string(metadata.get("ttsProvider"), DEFAULT_TTS_PROVIDER).lower()
     tts_voice = _normalize_string(metadata.get("ttsVoiceId") or metadata.get("speaker"), DEFAULT_TTS_VOICE_ID)
 
-    stt_provider = "deepgram" if stt_model == "deepgram" else "openai"
+    stt_provider = (
+        stt_model
+        if stt_model in ("openai", "deepgram", "smallest", "assemblyai", "sarvam")
+        else "openai"
+    )
     llm_provider = "openai" if llm_model.startswith("gpt-") else "anthropic"
     if llm_model.startswith("gemini"):
         llm_provider = "google"
@@ -430,6 +443,18 @@ def _build_stt(ai_config: dict):
             return deepgram.STT(model=model, language=language)
         logger.warning("Deepgram STT requested but DEEPGRAM_API_KEY is not configured; falling back to OpenAI")
 
+    if provider == "smallest":
+        if SmallestSTT is not None and os.getenv("SMALLEST_API_KEY"):
+            logger.info("Using SmallestAI Pulse STT: language=%s", language)
+            return SmallestSTT(
+                language=language,
+                sample_rate=16000,
+                encoding="linear16",
+                word_timestamps=True,
+                eou_timeout_ms=0,  # let LiveKit turn detection handle EOU
+            )
+        logger.warning("SmallestAI Pulse STT requested but unavailable; falling back to OpenAI")
+
     if provider == "assemblyai" and assemblyai is not None:
         logger.info("Using AssemblyAI STT: model=%s language=%s", model, language)
         return assemblyai.STT(model=model, language=language)
@@ -438,7 +463,7 @@ def _build_stt(ai_config: dict):
         logger.info("Using Sarvam STT: model=%s language=%s", model, language)
         return sarvam.STT(model=model, language=language)
 
-    if provider not in ("openai", "deepgram"):
+    if provider not in ("openai", "deepgram", "smallest", "assemblyai", "sarvam"):
         logger.warning("Unsupported or unavailable STT provider requested: %s. Falling back to OpenAI.", provider)
 
     logger.info("Using OpenAI STT: model=%s language=%s", DEFAULT_OPENAI_STT_MODEL, "en")
@@ -1012,8 +1037,14 @@ def prewarm(proc: JobProcess) -> None:
 
     On LiveKit Cloud the worker is long-lived and handles many calls, so loading
     the VAD here (instead of per-session) cuts per-call cold-start latency.
+    Telephony-tuned params match narrowband 8 kHz SIP audio.
     """
-    proc.userdata["vad"] = silero.VAD.load()
+    proc.userdata["vad"] = silero.VAD.load(
+        min_speech_duration=0.2,
+        min_silence_duration=0.5,
+        padding_duration=0.1,
+        sample_rate=8000,
+    )
 
 
 # ── Agent server ──────────────────────────────────────────────────────────────
@@ -1260,6 +1291,8 @@ async def entrypoint(ctx: agents.JobContext):
                 candidate_word_count=word_count,
                 transcript_turn_count=len(transcript),
                 webhook_url=call_webhook_url,
+                candidate_word_count=word_count,
+                transcript_turn_count=len(transcript),
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
@@ -1366,20 +1399,6 @@ async def entrypoint(ctx: agents.JobContext):
             ctx.shutdown()
             return
         try:
-            has_custom_prompt = prompt_text and prompt_text.strip() != ""
-            greeting_instructions = (
-                "The candidate has answered. Greet them warmly and begin the interview as described in your instructions."
-                if has_custom_prompt
-                else "The candidate has answered. Greet them with exactly: Hello, this is priya calling from Bhanzu. I'm reaching out regarding your application for the Business Development Associate role. Is this a good time to talk?"
-            )
-
-            # Pre-generate the greeting while the phone is ringing so TTS audio
-            # is buffered and plays immediately when the call is answered.
-            # generate_reply() returns a SpeechHandle and schedules generation
-            # internally — no await/create_task needed.
-            session.generate_reply(instructions=greeting_instructions)
-
-            # Create a SIP participant to dial out
             await ctx.api.sip.create_sip_participant(
                 api.CreateSIPParticipantRequest(
                     room_name=ctx.room.name,
@@ -1394,7 +1413,24 @@ async def entrypoint(ctx: agents.JobContext):
             
             # Reset the call start time NOW (after the call is actually answered)
             agent._call_start_time = time.time()
-            
+
+            has_custom_prompt = prompt_text and prompt_text.strip() != ""
+            if has_custom_prompt:
+                await session.generate_reply(
+                    instructions=(
+                        "The candidate has answered. Greet them warmly and begin the interview "
+                        "as described in your instructions."
+                    )
+                )
+            else:
+                await session.generate_reply(
+                    instructions=(
+                        "The candidate has answered. Greet them with exactly: Hello, this is priya "
+                        "calling from Bhanzu. I'm reaching out regarding your application for the "
+                        "Business Development Associate role. Is this a good time to talk?"
+                    )
+                )
+
         except Exception as e:
             err_str = str(e).lower()
             logger.error(f"Failed to place outbound call: {e}")

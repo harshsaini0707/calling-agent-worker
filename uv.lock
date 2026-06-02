@@ -1016,6 +1016,19 @@ wheels = [
 ]
 
 [[package]]
+name = "livekit-plugins-smallestai"
+version = "1.5.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit-agents", extra = ["codecs"] },
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/cb/ad/f93187c8ff10f0da57dfd4a50f18c74b8c5f82789786227deff1cd564df9/livekit_plugins_smallestai-1.5.12.tar.gz", hash = "sha256:27d1710da9c5431f5f71907a4b19ac2a5ebe9d0c187883029f0c5c2ee2c4142b", size = 11079, upload-time = "2026-05-21T02:30:20.04Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ec/62/5cc9845728ce4c2b71fecf3c7a8c60dad25b6c3d6d2393fd06ab5bd22954/livekit_plugins_smallestai-1.5.12-py3-none-any.whl", hash = "sha256:28e280ea061c4ef7e254a2cbca10d2fd235213614b26bd36a540d0103f83a39c", size = 13328, upload-time = "2026-05-21T02:30:18.93Z" },
+]
+
+[[package]]
 name = "livekit-protocol"
 version = "1.1.11"
 source = { registry = "https://pypi.org/simple" }
@@ -2297,6 +2310,7 @@ dependencies = [
     { name = "livekit-agents", extra = ["anthropic", "deepgram", "openai", "silero"] },
     { name = "livekit-plugins-noise-cancellation" },
     { name = "livekit-plugins-sarvam" },
+    { name = "livekit-plugins-smallestai" },
     { name = "python-dotenv" },
 ]
 
@@ -2326,6 +2340,7 @@ requires-dist = [
     { name = "livekit-plugins-elevenlabs", marker = "extra == 'elevenlabs'", specifier = ">=1.5.0,<2.0.0" },
     { name = "livekit-plugins-noise-cancellation" },
     { name = "livekit-plugins-sarvam", specifier = ">=1.5.9,<2.0.0" },
+    { name = "livekit-plugins-smallestai", specifier = "==1.5.12" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.23.0" },
     { name = "pytest-mock", marker = "extra == 'dev'", specifier = ">=3.12.0" },
