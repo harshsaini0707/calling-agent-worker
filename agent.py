@@ -283,9 +283,6 @@ async def report_outcome(
     candidate_word_count: int = None,
     transcript_turn_count: int = None,
     webhook_url: str = None,
-    error_message: str = None,
-    candidate_word_count: int = None,
-    transcript_turn_count: int = None,
 ):
     if not schedule_id:
         return
@@ -1057,17 +1054,34 @@ server.setup_fnc = prewarm
 AMBIENT_PCM_DATA = None
 
 def init_ambient_audio(file_path: str, volume_reduction_db: int = 20):
-    """Load ambient audio into global memory once on startup."""
+    """Load ambient audio into global memory once on startup.
+    
+    Applies a short crossfade at the loop boundary so the 35-second clip
+    loops seamlessly without any click or pop.
+    """
     global AMBIENT_PCM_DATA
     if not os.path.exists(file_path):
         logger.warning(f"Ambient audio file not found: {file_path}")
         return
-        
+
     logger.info(f"Pre-loading ambient audio: {file_path}...")
     audio_segment = AudioSegment.from_file(file_path) - volume_reduction_db
     audio_segment = audio_segment.set_frame_rate(48000).set_channels(1).set_sample_width(2)
+
+    # Apply a 200ms crossfade so the end blends smoothly into the beginning
+    # This eliminates any click/pop at the loop boundary
+    crossfade_ms = 200
+    if len(audio_segment) > crossfade_ms * 2:
+        looped = audio_segment + audio_segment  # double it
+        audio_segment = looped.fade(
+            to_gain=-120,
+            start=len(audio_segment) - crossfade_ms,
+            end=len(audio_segment),
+        )
+        audio_segment = audio_segment[:len(audio_segment) // 2]  # trim back
+
     AMBIENT_PCM_DATA = audio_segment.raw_data
-    logger.info("Ambient audio loaded globally.")
+    logger.info(f"Ambient audio loaded globally ({len(AMBIENT_PCM_DATA) // 1024}KB raw PCM).")
 
 async def stream_ambient_audio(room: rtc.Room):
     """Continuously stream global ambient audio to the room."""
@@ -1091,8 +1105,12 @@ async def stream_ambient_audio(room: rtc.Room):
     try:
         while True:
             if cursor + bytes_per_frame > total_bytes:
-                cursor = 0 
-                
+                # Seamless loop — reset cursor and re-anchor timing
+                # to prevent floating-point drift on very long calls
+                cursor = 0
+                start_time = time.time()
+                frames_sent = 0
+
             chunk = AMBIENT_PCM_DATA[cursor : cursor + bytes_per_frame]
             cursor += bytes_per_frame
 
@@ -1291,8 +1309,6 @@ async def entrypoint(ctx: agents.JobContext):
                 candidate_word_count=word_count,
                 transcript_turn_count=len(transcript),
                 webhook_url=call_webhook_url,
-                candidate_word_count=word_count,
-                transcript_turn_count=len(transcript),
             )
         except Exception as e:
             logger.error(f"Failed to report outcome: {e}")
